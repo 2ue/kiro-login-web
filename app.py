@@ -1,0 +1,1343 @@
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import hmac
+import io
+import json
+import logging
+import os
+import re
+import secrets
+import ssl
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zipfile
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+import device_code_auth as dca
+import idc_browser_login as idc
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+app.config["JSON_AS_ASCII"] = False
+SECRET_PATH = Path(__file__).parent / ".flask-secret"
+if not SECRET_PATH.exists():
+    SECRET_PATH.write_text(secrets.token_urlsafe(48), encoding="utf-8")
+    SECRET_PATH.chmod(0o600)
+app.secret_key = SECRET_PATH.read_text(encoding="utf-8").strip()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,
+)
+
+JOBS: dict[str, "Job"] = {}
+JOBS_LOCK = threading.RLock()
+CUSTOMERS_PATH = Path(__file__).parent / "customers.json"
+CUSTOMERS_LOCK = threading.RLock()
+HISTORY_PATH = Path(__file__).parent / "data" / "job_history.json"
+HISTORY_LIMIT = 120
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR.chmod(0o700)
+APP_LOG_PATH = LOG_DIR / "app.log"
+EXPORT_TTL_SECONDS = 3600
+CLEANUP_INTERVAL_SECONDS = 30
+MAX_ACCOUNTS_PER_JOB = 50
+MAX_ACTIVE_JOBS_PER_CUSTOMER = 2
+MAX_ACTIVE_JOBS_GLOBAL = 8
+MAX_THREADS_PER_JOB = 10
+MAX_BROWSER_SLOTS_GLOBAL = 20
+DEFAULT_START_URL = idc.DEFAULT_IDC_START_URL
+DEFAULT_NEW_PASSWORD = idc.DEFAULT_NEW_PASSWORD
+PROFILE_SCAN_REGIONS = ("us-east-1", "eu-central-1")
+ACCOUNT_SEP_RE = re.compile(r"[\t,;|]")
+KIRO_PROFILE_API_VERSION = "0.12.333"
+BLOCKED_PROXY_HOSTS = ("127.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "192.168.", "localhost", "0.0.0.0", "::1")
+
+logger = logging.getLogger("kiro-login-web")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    file_handler = RotatingFileHandler(APP_LOG_PATH, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(file_handler)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(stream_handler)
+
+
+def client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "") if request else ""
+    return (forwarded.split(",")[0].strip() or request.remote_addr or "-") if request else "-"
+
+
+def audit(event: str, **fields: Any) -> None:
+    safe_fields = {k: v for k, v in fields.items() if v is not None}
+    logger.info("%s %s", event, json.dumps(safe_fields, ensure_ascii=False, sort_keys=True))
+
+
+from urllib.parse import urlparse
+
+@app.before_request
+def reject_cross_site_posts():
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+    origin = request.headers.get("Origin")
+    if origin:
+        try:
+            origin_host = urlparse(origin).netloc.lower()
+        except Exception:
+            origin_host = ""
+        request_host = (request.headers.get("X-Forwarded-Host") or request.host or "").lower()
+        if origin_host != request_host:
+            audit("security.blocked_origin", origin=origin, host=request_host, ip=client_ip())
+            return jsonify({"error": "非法来源"}), 403
+    return None
+
+
+def password_hash(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def secure_password_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return "pbkdf2_sha256$200000$%s$%s" % (
+        base64.urlsafe_b64encode(salt).decode().rstrip("="),
+        base64.urlsafe_b64encode(digest).decode().rstrip("="),
+    )
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _, rounds, salt_b64, digest_b64 = stored.split("$", 3)
+            salt = base64.urlsafe_b64decode(salt_b64 + "=" * (-len(salt_b64) % 4))
+            expected = base64.urlsafe_b64decode(digest_b64 + "=" * (-len(digest_b64) % 4))
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(rounds))
+            return hmac.compare_digest(actual, expected)
+        except Exception:
+            return False
+    return hmac.compare_digest(password_hash(password), stored)
+
+
+def migrate_customer_password_hash(customer_id: str, password: str) -> None:
+    raw = read_customers_raw()
+    item = raw.get(customer_id)
+    if item and not str(item.get("passwordHash", "")).startswith("pbkdf2_sha256$"):
+        item["passwordHash"] = secure_password_hash(password)
+        item.pop("password", None)
+        save_customers_raw(raw)
+
+
+def load_customers() -> dict[str, dict[str, str]]:
+    with CUSTOMERS_LOCK:
+        if not CUSTOMERS_PATH.exists():
+            default_password = secrets.token_urlsafe(10)
+            CUSTOMERS_PATH.write_text(
+                json.dumps(
+                    {
+                        "default": {
+                            "name": "默认客户",
+                            "passwordHash": secure_password_hash(default_password),
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            CUSTOMERS_PATH.chmod(0o600)
+            print(f"[kiro-login-web] 已生成默认客户密码：{default_password}")
+            logger.warning("created_default_customer password_written_to=%s", CUSTOMERS_PATH)
+        raw = json.loads(CUSTOMERS_PATH.read_text(encoding="utf-8"))
+    customers: dict[str, dict[str, str]] = {}
+    for customer_id, item in raw.items():
+        password = item.get("password", "")
+        hashed = item.get("passwordHash") or (password_hash(password) if password else "")
+        if not hashed:
+            continue
+        customers[customer_id] = {
+            "id": customer_id,
+            "name": item.get("name") or customer_id,
+            "passwordHash": hashed,
+        }
+    return customers
+
+
+def read_customers_raw() -> dict[str, Any]:
+    with CUSTOMERS_LOCK:
+        if not CUSTOMERS_PATH.exists():
+            load_customers()
+        return json.loads(CUSTOMERS_PATH.read_text(encoding="utf-8"))
+
+
+def save_customers_raw(raw: dict[str, Any]) -> None:
+    with CUSTOMERS_LOCK:
+        CUSTOMERS_PATH.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        CUSTOMERS_PATH.chmod(0o600)
+
+
+def create_customer_for_password(password: str, name: str = "") -> dict[str, str]:
+    raw = read_customers_raw()
+    customer_id = "c_" + secrets.token_hex(6)
+    while customer_id in raw:
+        customer_id = "c_" + secrets.token_hex(6)
+    customer_name = name.strip() or f"客户 {customer_id[-6:]}"
+    raw[customer_id] = {
+        "name": customer_name,
+        "passwordHash": secure_password_hash(password),
+        "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    save_customers_raw(raw)
+    return {"id": customer_id, "name": customer_name, "passwordHash": raw[customer_id]["passwordHash"]}
+
+
+def update_customer_name(customer_id: str, name: str) -> str:
+    new_name = name.strip()
+    if not new_name:
+        return load_customers().get(customer_id, {}).get("name", customer_id)
+    raw = read_customers_raw()
+    if customer_id in raw:
+        raw[customer_id]["name"] = new_name
+        save_customers_raw(raw)
+    return new_name
+
+
+def valid_custom_password(password: str) -> tuple[bool, str]:
+    if len(password) < 8:
+        return False, "密码至少 8 位"
+    if len(password) > 128:
+        return False, "密码过长"
+    if not re.search(r"[a-z]", password):
+        return False, "密码必须包含小写字母"
+    if not re.search(r"[A-Z]", password):
+        return False, "密码必须包含大写字母"
+    if not re.search(r"\d", password):
+        return False, "密码必须包含数字"
+    return True, ""
+
+
+def validate_start_url(value: str) -> tuple[bool, str]:
+    url = (value or "").strip()
+    if not url:
+        return False, "IDC Start URL 必填"
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+    except Exception:
+        return False, "IDC Start URL 格式不正确"
+    if parsed.scheme != "https":
+        return False, "IDC Start URL 必须是 https:// 开头"
+    host = (parsed.hostname or "").lower()
+    if not host.endswith(".awsapps.com"):
+        return False, "IDC Start URL 域名应为 *.awsapps.com"
+    if not parsed.path.rstrip("/").endswith("/start"):
+        return False, "IDC Start URL 通常应以 /start 结尾"
+    return True, url
+
+
+def customer_for_password(password: str) -> dict[str, str] | None:
+    for customer in load_customers().values():
+        if verify_password(password, customer["passwordHash"]):
+            migrate_customer_password_hash(customer["id"], password)
+            return customer
+    return None
+
+
+def current_customer_id() -> str | None:
+    return session.get("customer_id")
+
+
+def current_customer_name() -> str:
+    customers = load_customers()
+    cid = current_customer_id()
+    return customers.get(cid or "", {}).get("name", cid or "")
+
+
+def cleanup_expired_jobs() -> None:
+    now = time.time()
+    with JOBS_LOCK:
+        for job_id in list(JOBS):
+            job = JOBS[job_id]
+            expired = bool(job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS)
+            for path_attr, event_name in (("export_path", "export.expired_deleted"), ("api_keys_path", "apikeys.expired_deleted"), ("log_path", "joblog.expired_deleted")):
+                path_value = getattr(job, path_attr, "")
+                if path_value and expired:
+                    try:
+                        Path(path_value).unlink(missing_ok=True)
+                        audit(event_name, jobId=job.id, customerId=job.customer_id, path=path_value)
+                    except Exception:
+                        pass
+                    setattr(job, path_attr, "")
+            if expired and job.status != "expired" and not job.export_path and not job.api_keys_path and not job.log_path:
+                job.status = "expired"
+                job.log("导出文件已超过 60 分钟，已自动删除")
+            if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
+                JOBS.pop(job_id, None)
+                audit("job.evicted", jobId=job.id, customerId=job.customer_id)
+    save_job_history()
+
+
+def account_result_to_dict(result: "AccountResult") -> dict[str, Any]:
+    return {
+        "idx": result.idx,
+        "email": result.email,
+        "ok": result.ok,
+        "message": result.message,
+        "changedPassword": result.changed_password,
+        "exportedCount": len(result.exported),
+        "apiKeyCount": len(result.api_keys),
+    }
+
+
+def save_job_history() -> None:
+    try:
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        with JOBS_LOCK:
+            jobs = sorted(JOBS.values(), key=lambda item: item.created_at, reverse=True)[:HISTORY_LIMIT]
+            data = []
+            for job in jobs:
+                if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
+                    continue
+                data.append({
+                    "id": job.id,
+                    "customer_id": job.customer_id,
+                    "status": job.status,
+                    "created_at": job.created_at,
+                    "started_at": job.started_at,
+                    "finished_at": job.finished_at,
+                    "logs": job.logs[-120:],
+                    "results": [account_result_to_dict(result) for result in job.results],
+                    "export_path": job.export_path,
+                    "api_keys_path": job.api_keys_path,
+                    "log_path": job.log_path,
+                    "total": job.total,
+                    "threads": job.threads,
+                    "done": job.done,
+                    "ok": job.ok,
+                    "failed": job.failed,
+                    "error": job.error,
+                })
+        tmp = HISTORY_PATH.with_name(f"{HISTORY_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(HISTORY_PATH)
+    except Exception as exc:
+        logger.warning("save job history failed: %s", exc)
+
+
+def restore_job_history() -> None:
+    if not HISTORY_PATH.exists():
+        return
+    try:
+        data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        now = time.time()
+        with JOBS_LOCK:
+            for item in data:
+                finished_at = item.get("finished_at")
+                if finished_at and now - float(finished_at) > EXPORT_TTL_SECONDS * 2:
+                    continue
+                status = item.get("status") or "failed"
+                if status in {"queued", "running"}:
+                    status = "failed"
+                job = Job(
+                    id=item["id"],
+                    customer_id=item["customer_id"],
+                    status=status,
+                    created_at=float(item.get("created_at") or now),
+                    started_at=item.get("started_at"),
+                    finished_at=finished_at or now,
+                    logs=list(item.get("logs") or []),
+                    export_path=item.get("export_path") or "",
+                    api_keys_path=item.get("api_keys_path") or "",
+                    log_path=item.get("log_path") or "",
+                    total=int(item.get("total") or 0),
+                    threads=int(item.get("threads") or 1),
+                    done=int(item.get("done") or 0),
+                    ok=int(item.get("ok") or 0),
+                    failed=int(item.get("failed") or 0),
+                    error=item.get("error") or "",
+                )
+                for result in item.get("results") or []:
+                    job.results.append(AccountResult(
+                        int(result.get("idx") or 0),
+                        result.get("email") or "",
+                        bool(result.get("ok")),
+                        result.get("message") or "",
+                        bool(result.get("changedPassword")),
+                    ))
+                JOBS[job.id] = job
+    except Exception as exc:
+        logger.warning("restore job history failed: %s", exc)
+
+
+def restore_jobs_from_exports() -> None:
+    exports_root = Path(__file__).parent / "exports"
+    if not exports_root.exists():
+        return
+    now = time.time()
+    with JOBS_LOCK:
+        for customer_dir in exports_root.iterdir():
+            if not customer_dir.is_dir():
+                continue
+            customer_id = customer_dir.name
+            for path in customer_dir.iterdir():
+                if not path.is_file():
+                    continue
+                match = re.match(r"kiro-(?:login-export|api-keys|job-log)-([0-9a-f]{16})\.(?:json|txt)$", path.name)
+                if not match:
+                    continue
+                job_id = match.group(1)
+                job = JOBS.get(job_id)
+                if not job:
+                    mtime = path.stat().st_mtime
+                    job = Job(
+                        id=job_id,
+                        customer_id=customer_id,
+                        status="finished" if path.name.startswith(("kiro-login-export", "kiro-api-keys")) else "failed",
+                        created_at=mtime,
+                        started_at=mtime,
+                        finished_at=mtime,
+                    )
+                    JOBS[job_id] = job
+                if path.name.startswith("kiro-login-export"):
+                    job.export_path = str(path)
+                    try:
+                        exported = json.loads(path.read_text(encoding="utf-8"))
+                        if isinstance(exported, list):
+                            job.ok = max(job.ok, len(exported))
+                            job.done = max(job.done, len(exported))
+                            job.total = max(job.total, len(exported))
+                    except Exception:
+                        pass
+                elif path.name.startswith("kiro-api-keys"):
+                    job.api_keys_path = str(path)
+                    try:
+                        count = len([line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()])
+                        job.ok = max(job.ok, count)
+                        job.done = max(job.done, count)
+                        job.total = max(job.total, count)
+                    except Exception:
+                        pass
+                elif path.name.startswith("kiro-job-log"):
+                    job.log_path = str(path)
+                    try:
+                        job.logs = path.read_text(encoding="utf-8", errors="replace").splitlines()[-120:]
+                        for line in reversed(job.logs):
+                            progress = re.search(r"进度\s+(\d+)/(\d+)", line)
+                            if progress:
+                                job.done = max(job.done, int(progress.group(1)))
+                                job.total = max(job.total, int(progress.group(2)))
+                                break
+                    except Exception:
+                        pass
+                if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
+                    continue
+    save_job_history()
+
+
+def cleanup_loop() -> None:
+    while True:
+        time.sleep(CLEANUP_INTERVAL_SECONDS)
+        cleanup_expired_jobs()
+
+
+def simplify_job_message(message: str) -> str | None:
+    msg = message.strip()
+    replacements = [
+        ("mo trang login", "打开登录页"),
+        ("nhap username/email", "输入账号"),
+        ("nhap password", "输入密码"),
+        ("form DOI MAT KHAU lan dau -> dat password moi", "首次登录，设置新密码"),
+        ("khong con form/nut consent -> coi nhu da xong", "登录流程完成"),
+        ("da qua password, dang doi trang xac nhan/Allow access", "密码已通过，等待授权确认页面/Allow access"),
+        ("device-code: cho ban login browser & dang poll token", "等待 AWS 返回授权 token"),
+        ("Het han cho login (khong nhan duoc token).", "等待授权 token 超时，可能未真正点击 Allow access 或页面流程异常"),
+        ("CreateToken loi", "获取授权 token 失败"),
+        ("chua qua password", "密码验证未通过，重试"),
+        ("Timeout - khong hoan tat login trong thoi gian cho.", "登录超时，未在限定时间内完成"),
+        ("Gap buoc MFA/2FA - account nay co bao mat 2 lop, dung lai.", "遇到 MFA/2FA 二次验证，已停止"),
+        ("Login that bai o trang password", "密码步骤失败"),
+        ("Sign-in bi tu choi (reset ve username)", "登录被拒绝，页面退回账号输入"),
+        ("Khong qua duoc buoc username (email sai?).", "账号步骤失败，可能账号不存在或 IDC Start URL 不匹配"),
+        ("Da huy", "任务已取消"),
+        ("khong qua duoc (sai pass?)", "无法通过，可能密码错误"),
+        ("sai pass", "密码错误"),
+        ("Doi mat khau bi ket o form qua nhieu lan", "首次登录改密码失败"),
+        ("Doi mat khau that bai", "首次登录改密码失败"),
+        ("Invalid password", "密码不符合 AWS 改密策略或当前密码已不匹配"),
+        ("invalid password", "密码不符合 AWS 改密策略或当前密码已不匹配"),
+        ("password policy/sign-in rejected", "密码策略不通过或登录被拒绝"),
+        ("-> approved", "授权成功"),
+    ]
+    if "[debug]" in msg or "metadata1 chua san sang" in msg:
+        return None
+    if "-> click" in msg:
+        return None
+    hidden_fragments = (
+        "device-code: OIDC=",
+        "device-code: RegisterClient",
+        "client_id:",
+        "device-code: StartDeviceAuthorization",
+        "user_code:",
+        "verify:",
+        "-> nhan duoc token",
+    )
+    if any(fragment in msg for fragment in hidden_fragments):
+        return None
+    for old, new in replacements:
+        msg = msg.replace(old, new)
+    msg = msg.replace("(clean, no cache)", "")
+    msg = msg.replace("...", "")
+    msg = msg.replace("lan ", "第")
+    msg = re.sub(r"\s+", " ", msg).strip()
+    return msg
+
+
+@dataclass
+class AccountInput:
+    idx: int
+    email: str
+    password: str
+    proxy: str = ""
+
+
+@dataclass
+class AccountResult:
+    idx: int
+    email: str
+    ok: bool
+    message: str
+    changed_password: bool = False
+    exported: list[dict[str, Any]] = field(default_factory=list)
+    api_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Job:
+    id: str
+    customer_id: str
+    status: str = "queued"
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    logs: list[str] = field(default_factory=list)
+    results: list[AccountResult] = field(default_factory=list)
+    export_path: str = ""
+    api_keys_path: str = ""
+    log_path: str = ""
+    total: int = 0
+    threads: int = 1
+    done: int = 0
+    ok: int = 0
+    failed: int = 0
+    error: str = ""
+
+    def log(self, message: str) -> None:
+        simplified = simplify_job_message(message)
+        if not simplified:
+            return
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        line = f"[{stamp}] {simplified}"
+        with JOBS_LOCK:
+            self.logs.append(line)
+            self.logs = self.logs[-120:]
+            log_path = self.log_path
+        if log_path:
+            try:
+                with Path(log_path).open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except Exception as exc:
+                audit("joblog.write_failed", jobId=self.id, customerId=self.customer_id, path=log_path, error=str(exc))
+        logger.info("job.log %s", json.dumps({"jobId": self.id, "customerId": self.customer_id, "message": simplified}, ensure_ascii=False))
+        save_job_history()
+
+
+def parse_accounts(text: str) -> list[AccountInput]:
+    accounts: list[AccountInput] = []
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = re.split(r"\s{2,}#", line, maxsplit=1)[0].rstrip()
+        if ACCOUNT_SEP_RE.search(line):
+            parts = ACCOUNT_SEP_RE.split(line)
+        else:
+            parts = line.split(":", 1)
+        parts = [p.strip() for p in parts]
+        email = parts[0] if parts else ""
+        password = parts[1] if len(parts) > 1 else ""
+        proxy = sanitize_proxy(parts[2] if len(parts) > 2 else "")
+        if not email or not password or email.lower() in {"email", "username", "user", "account"}:
+            continue
+        accounts.append(AccountInput(idx=idx, email=email, password=password, proxy=proxy))
+    return accounts
+
+
+def sanitize_proxy(proxy: str) -> str:
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return ""
+    lowered = proxy.lower()
+    if not lowered.startswith(("http://", "https://", "socks5://")):
+        return ""
+    host = lowered.split("://", 1)[1].split("/", 1)[0].split("@")[-1].split(":", 1)[0].strip("[]")
+    if any(host == blocked or host.startswith(blocked) for blocked in BLOCKED_PROXY_HOSTS):
+        return ""
+    return proxy
+
+
+def post_json(url: str, body: dict[str, Any], headers: dict[str, str], timeout: float = 30.0) -> tuple[int, dict[str, Any]]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers=headers,
+    )
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace")
+            return resp.status, json.loads(text) if text else {}
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", "replace")
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = {"_raw": text}
+        return exc.code, data
+
+
+def list_profiles_all_regions(access_token: str, preferred_region: str, log, exhaustive: bool = False) -> list[dict[str, str]]:
+    regions: list[str] = []
+    for region in (preferred_region, *PROFILE_SCAN_REGIONS):
+        region = dca.normalize_kiro_region(region)
+        if region not in regions:
+            regions.append(region)
+
+    profiles_by_arn: dict[str, dict[str, str]] = {}
+    machine_id = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    user_agent = (
+        "aws-sdk-js/1.0.0 ua/2.1 os/Linux lang/js md/nodejs#24 "
+        f"api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{KIRO_PROFILE_API_VERSION}-{machine_id}"
+    )
+    amz_user_agent = f"aws-sdk-js/1.0.0 KiroIDE-{KIRO_PROFILE_API_VERSION}-{machine_id}"
+    for region in regions:
+        host = f"q.{region}.amazonaws.com"
+        next_token = None
+        while True:
+            body: dict[str, Any] = {"maxResults": 10}
+            if next_token:
+                body["nextToken"] = next_token
+            status, data = post_json(
+                dca.kiro_q_url(region),
+                body,
+                {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/x-amz-json-1.0",
+                    "x-amz-target": dca.CW_LIST_PROFILES_TARGET,
+                    "x-amz-user-agent": amz_user_agent,
+                    "User-Agent": user_agent,
+                    "Host": host,
+                    "amz-sdk-invocation-id": str(uuid.uuid4()),
+                    "amz-sdk-request": "attempt=1; max=1",
+                    "Connection": "close",
+                },
+            )
+            if status >= 400:
+                log(f"ListAvailableProfiles {region} HTTP {status}: {str(data)[:160]}")
+                break
+            for item in data.get("profiles") or []:
+                arn = (item.get("arn") or item.get("profileArn") or "").strip()
+                if not arn:
+                    continue
+                profiles_by_arn[arn] = {
+                    "arn": arn,
+                    "profileName": item.get("profileName") or item.get("name") or "",
+                    "region": dca.region_from_profile_arn(arn) or region,
+                }
+            next_token = data.get("nextToken")
+            if not next_token:
+                break
+        if profiles_by_arn and not exhaustive:
+            break
+    return list(profiles_by_arn.values())
+
+
+def expires_at_ms(expires_at_iso: str) -> int:
+    try:
+        value = expires_at_iso.replace("Z", "+00:00")
+        return int(dt.datetime.fromisoformat(value).timestamp() * 1000)
+    except Exception:
+        return int(time.time() * 1000)
+
+
+def machine_id_for(email: str, profile_arn: str) -> str:
+    return hashlib.sha256(f"{email}|{profile_arn}".encode("utf-8")).hexdigest()
+
+
+def flatten_export(exp: dca.DurableExport, email: str, profile: dict[str, str], priority: int) -> dict[str, Any]:
+    arn = profile["arn"]
+    auth_region = exp.oidc_region or dca.DEFAULT_OIDC_REGION
+    api_region = profile.get("region") or dca.region_from_profile_arn(arn) or exp.region
+    return {
+        "email": email,
+        "idp": "Enterprise",
+        "profileArn": arn,
+        "machineId": machine_id_for(email, arn),
+        "priority": priority,
+        "status": "active",
+        "accessToken": exp.access_token,
+        "refreshToken": exp.refresh_token,
+        "clientId": exp.client_id,
+        "clientSecret": exp.client_secret,
+        "authMethod": "IdC",
+        "provider": "Enterprise",
+        "region": auth_region,
+        "authRegion": auth_region,
+        "apiRegion": api_region,
+        "startUrl": exp.start_url,
+        "expiresAt": expires_at_ms(exp.expires_at),
+    }
+
+
+def describe_kiro_profile_error(status: int, data: dict[str, Any]) -> str:
+    message = str(data.get("message") or data.get("Message") or data.get("_raw") or data)
+    reason = str(data.get("reason") or data.get("Reason") or "")
+    if status == 403 and ("TEMPORARILY_SUSPENDED" in reason or "temporarily suspended" in message.lower()):
+        return "Kiro 账号已被 AWS 临时暂停：检测到异常活动，需要联系 AWS/Kiro 支持恢复"
+    if status == 403:
+        return f"Kiro 上游拒绝访问（403）：{message[:160]}"
+    return f"Kiro profile 检查失败（HTTP {status}）：{message[:160]}"
+
+
+def check_profile_available(exp: dca.DurableExport, profile: dict[str, str], strict_call_probe: bool = False) -> str:
+    arn = profile["arn"]
+    region = profile.get("region") or dca.region_from_profile_arn(arn) or exp.region
+    status, data = dca.get_profile(exp.access_token, arn, region)
+    if status >= 400:
+        return describe_kiro_profile_error(status, data)
+    if strict_call_probe:
+        status, data = dca.probe_generate_assistant(exp.access_token, arn, region)
+        if status >= 400:
+            return describe_kiro_profile_error(status, data)
+        if status == 0:
+            message = str(data.get("_raw") or data)
+            return f"Kiro 调用可用性检查失败：{message[:160]}"
+    return ""
+
+
+def create_api_key_export(exp: dca.DurableExport, email: str, profile: dict[str, str], label: str, log) -> str:
+    arn = profile["arn"]
+    region = profile.get("region") or dca.region_from_profile_arn(arn) or exp.region
+    status, profile_data = dca.get_profile(exp.access_token, arn, region)
+    if status >= 400:
+        raise RuntimeError(f"GetProfile HTTP {status}: {str(profile_data)[:200]}")
+    if not dca.api_keys_enabled(profile_data):
+        raise RuntimeError("该 profile 未开启 API Keys 功能，请先在 Kiro 门户开启")
+    status, created = dca.create_api_key(exp.access_token, arn, region, label)
+    if status >= 400 or not created.get("rawKey"):
+        raise RuntimeError(f"CreateApiKey HTTP {status}: {str(created)[:200]}")
+    raw_key = created.get("rawKey") or ""
+    log(f"API Key 创建成功：{created.get('keyPrefix') or raw_key[:12]}...")
+    return raw_key
+
+
+def normalize_json_credential(item: dict[str, Any]) -> dict[str, str]:
+    def pick(*names: str) -> str:
+        for name in names:
+            value = item.get(name)
+            if value:
+                return str(value).strip()
+        return ""
+    profile_arn = pick("profileArn", "profile_arn")
+    api_region = pick("apiRegion", "api_region") or dca.region_from_profile_arn(profile_arn) or pick("region")
+    oidc_region = pick("authRegion", "auth_region", "oidcRegion", "oidc_region") or pick("region") or dca.DEFAULT_OIDC_REGION
+    return {
+        "email": pick("email", "id"),
+        "refresh_token": pick("refreshToken", "refresh_token"),
+        "client_id": pick("clientId", "client_id"),
+        "client_secret": pick("clientSecret", "client_secret"),
+        "profile_arn": profile_arn,
+        "oidc_region": oidc_region,
+        "api_region": api_region,
+    }
+
+
+def load_json_credentials_from_zip(file_storage) -> list[dict[str, str]]:
+    raw = file_storage.read()
+    if not raw:
+        raise ValueError("ZIP 文件为空")
+    if len(raw) > 10 * 1024 * 1024:
+        raise ValueError("ZIP 文件不能超过 10MB")
+    rows: list[dict[str, str]] = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        infos = [info for info in zf.infolist() if not info.is_dir() and info.filename.lower().endswith(".json")]
+        if len(infos) > MAX_ACCOUNTS_PER_JOB:
+            raise ValueError(f"单次最多处理 {MAX_ACCOUNTS_PER_JOB} 个 JSON")
+        for info in infos:
+            if info.file_size > 256 * 1024:
+                raise ValueError(f"JSON 文件过大：{info.filename}")
+            data = json.loads(zf.read(info).decode("utf-8"))
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                row = normalize_json_credential(item)
+                missing = [k for k in ("refresh_token", "client_id", "client_secret", "profile_arn") if not row.get(k)]
+                if missing:
+                    raise ValueError(f"{info.filename} 缺少字段：{', '.join(missing)}")
+                rows.append(row)
+    if not rows:
+        raise ValueError("ZIP 内没有可用 JSON 凭据")
+    if len(rows) > MAX_ACCOUNTS_PER_JOB:
+        raise ValueError(f"单次最多处理 {MAX_ACCOUNTS_PER_JOB} 条凭据")
+    return rows
+
+
+def run_json_api_key_one(job: Job, row: dict[str, str], label: str) -> AccountResult:
+    email = row.get("email") or row.get("profile_arn", "")[-18:]
+    log = lambda m: job.log(f"#{row.get('idx', '?')} {email}: {m}")
+    status, token_data = dca.refresh_access_token(
+        row["refresh_token"],
+        row["client_id"],
+        row["client_secret"],
+        row.get("oidc_region") or dca.DEFAULT_OIDC_REGION,
+    )
+    if status >= 400 or not token_data.get("accessToken"):
+        return AccountResult(int(row.get("idx", 0)), email, False, f"刷新 token 失败：HTTP {status}")
+    access_token = token_data["accessToken"]
+    profile_arn = row["profile_arn"]
+    api_region = row.get("api_region") or dca.region_from_profile_arn(profile_arn) or dca.DEFAULT_KIRO_REGION
+    status, profile_data = dca.get_profile(access_token, profile_arn, api_region)
+    if status >= 400:
+        return AccountResult(int(row.get("idx", 0)), email, False, describe_kiro_profile_error(status, profile_data))
+    if not dca.api_keys_enabled(profile_data):
+        return AccountResult(int(row.get("idx", 0)), email, False, "该 profile 未开启 API Keys")
+    status, created = dca.create_api_key(access_token, profile_arn, api_region, label)
+    raw_key = created.get("rawKey") if isinstance(created, dict) else ""
+    if status >= 400 or not raw_key:
+        return AccountResult(int(row.get("idx", 0)), email, False, f"CreateApiKey 失败：HTTP {status}")
+    return AccountResult(int(row.get("idx", 0)), email, True, "API Key 创建成功", api_keys=[raw_key])
+
+
+def run_json_api_key_job(job: Job, rows: list[dict[str, str]], options: dict[str, Any]) -> None:
+    job.status = "running"
+    label = options.get("api_key_label") or "1"
+    threads = max(1, min(int(options.get("threads") or 3), MAX_THREADS_PER_JOB, len(rows)))
+    job.threads = threads
+    out_dir = Path(__file__).parent / "exports" / job.customer_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.chmod(0o700)
+    job.log_path = str(out_dir / f"kiro-job-log-{job.id}.txt")
+    Path(job.log_path).touch(mode=0o600, exist_ok=True)
+    job.api_keys_path = str(out_dir / f"kiro-api-keys-{job.id}.txt")
+    api_keys_file = Path(job.api_keys_path)
+    api_keys_file.touch(mode=0o600, exist_ok=True)
+    api_keys_file.chmod(0o600)
+    job.log(f"开始 JSON 开通 API Key：凭据 {len(rows)} 条，并发 {threads}")
+    api_keys_all: list[str] = []
+    try:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = []
+            for idx, row in enumerate(rows, start=1):
+                row = dict(row)
+                row["idx"] = str(idx)
+                futures.append(executor.submit(run_json_api_key_one, job, row, label))
+            for future in as_completed(futures):
+                result = future.result()
+                with JOBS_LOCK:
+                    job.results.append(result)
+                    job.done += 1
+                    if result.ok:
+                        job.ok += 1
+                        api_keys_all.extend(result.api_keys)
+                        for api_key in result.api_keys:
+                            with api_keys_file.open("a", encoding="utf-8") as fh:
+                                fh.write(api_key + "\n")
+                    else:
+                        job.failed += 1
+                    save_job_history()
+                job.log(f"进度 {job.done}/{job.total}：{result.email} - {result.message}")
+        job.status = "finished" if job.failed == 0 else "failed"
+        job.log(f"完成：成功 {job.ok}，失败 {job.failed}，API Key {len(api_keys_all)} 条")
+        audit("json_apikey_job.finished", jobId=job.id, customerId=job.customer_id, ok=job.ok, failed=job.failed, apiKeys=len(api_keys_all), apiKeysPath=job.api_keys_path or None)
+    except Exception as exc:
+        job.status = "failed"
+        job.log(f"任务失败：{exc}")
+        audit("json_apikey_job.failed", jobId=job.id, customerId=job.customer_id, error=str(exc))
+    finally:
+        job.finished_at = time.time()
+        save_job_history()
+
+
+def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResult:
+    prefix = f"#{acc.idx} {acc.email}"
+
+    def log(message: str) -> None:
+        job.log(f"{prefix}: {message}")
+
+    log("开始登录")
+    start = dca.register_and_start(
+        oidc_region=options["oidc_region"],
+        kiro_region=options["kiro_region"],
+        start_url=options["start_url"],
+        log=log,
+    )
+    if not start.ok:
+        log(f"获取登录 URL 失败：{start.error}")
+        return AccountResult(acc.idx, acc.email, False, start.error)
+
+    log("已获取登录 URL，开始浏览器登录")
+
+    outcome = idc.drive_login(
+        start.verification_uri_complete,
+        acc.email,
+        acc.password,
+        options["new_password"],
+        log=log,
+        headless=options["headless"],
+        proxy=acc.proxy,
+        timeout_s=options["login_timeout"],
+        window_index=acc.idx - 1,
+        window_count=options["threads"],
+    )
+    if not outcome.ok:
+        log(f"浏览器登录失败：{outcome.error}")
+        return AccountResult(acc.idx, acc.email, False, outcome.error, outcome.changed_password)
+
+    log("浏览器授权完成，开始换取 token")
+
+    exp = dca.poll_for_token(start, fetch_profile=False, log=log)
+    if exp.error:
+        log(f"换取 token 失败：{exp.error}")
+        return AccountResult(acc.idx, acc.email, False, exp.error, outcome.changed_password)
+    exp.email = acc.email
+
+    log("token 获取成功，开始扫描 profileArn")
+    profiles = list_profiles_all_regions(exp.access_token, options["kiro_region"], log, options.get("scan_all_regions", False))
+    if not profiles:
+        log("未获取到 profileArn")
+        return AccountResult(
+            acc.idx,
+            acc.email,
+            False,
+            "登录成功但未获取到 profileArn；已扫描 us-east-1/eu-central-1",
+            outcome.changed_password,
+        )
+
+    exported: list[dict[str, Any]] = []
+    for profile in profiles:
+        check_error = check_profile_available(exp, profile, options.get("strict_probe", False))
+        if check_error:
+            log(check_error)
+            return AccountResult(acc.idx, acc.email, False, check_error, outcome.changed_password)
+        exported.append(flatten_export(exp, acc.email, profile, 0))
+    api_keys: list[str] = []
+    if options.get("create_api_keys"):
+        api_label = options.get("api_key_label") or "1"
+        for profile in profiles:
+            try:
+                api_keys.append(create_api_key_export(exp, acc.email, profile, api_label, log))
+            except Exception as exc:
+                log(f"API Key 创建失败：{exc}")
+                return AccountResult(
+                    acc.idx,
+                    acc.email,
+                    False,
+                    f"登录成功但 API Key 创建失败：{exc}",
+                    outcome.changed_password,
+                    exported,
+                    api_keys,
+                )
+    suffix = f"，apiKeys={len(api_keys)}" if options.get("create_api_keys") else ""
+    log(f"账号处理完成：profile {len(exported)} 个{suffix}")
+    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个{suffix}", outcome.changed_password, exported, api_keys)
+
+
+def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> None:
+    job.status = "running"
+    job.started_at = time.time()
+    job.total = len(accounts)
+    threads = max(1, min(options["threads"], len(accounts)))
+    out_dir = Path(__file__).parent / "exports" / job.customer_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.chmod(0o700)
+    job.log_path = str(out_dir / f"kiro-job-log-{job.id}.txt")
+    Path(job.log_path).touch(mode=0o600, exist_ok=True)
+    job.log(f"开始任务：账号 {len(accounts)} 个，并发 {threads}，单号超时 {options['login_timeout']} 秒")
+    audit("job.started", jobId=job.id, customerId=job.customer_id, total=len(accounts), threads=threads, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"])
+    exported_all: list[dict[str, Any]] = []
+    api_keys_all: list[str] = []
+    try:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(run_one, job, acc, options): acc for acc in accounts}
+            for future in as_completed(futures):
+                acc = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = AccountResult(acc.idx, acc.email, False, f"任务异常：{exc}")
+                with JOBS_LOCK:
+                    job.results.append(result)
+                    job.results.sort(key=lambda item: item.idx)
+                    job.done += 1
+                    if result.ok:
+                        job.ok += 1
+                        exported_all.extend(result.exported)
+                        api_keys_all.extend(result.api_keys)
+                    else:
+                        job.failed += 1
+                    save_job_history()
+                job.log(f"{acc.email}: {result.message}（进度 {job.done}/{job.total}）")
+        if not options.get("api_key_only"):
+            for priority, item in enumerate(exported_all):
+                item["priority"] = priority
+        if not options.get("api_key_only"):
+            out_path = out_dir / f"kiro-login-export-{job.id}.json"
+            out_path.write_text(json.dumps(exported_all, ensure_ascii=False, indent=2), encoding="utf-8")
+            out_path.chmod(0o600)
+            job.export_path = str(out_path)
+        else:
+            out_path = None
+        if api_keys_all:
+            api_keys_path = out_dir / f"kiro-api-keys-{job.id}.txt"
+            api_keys_path.write_text("\n".join(api_keys_all) + "\n", encoding="utf-8")
+            api_keys_path.chmod(0o600)
+            job.api_keys_path = str(api_keys_path)
+        job.status = "finished" if job.failed == 0 else "failed"
+        job.log(f"完成：成功 {job.ok}，失败 {job.failed}，导出 {0 if options.get('api_key_only') else len(exported_all)} 条，API Key {len(api_keys_all)} 条")
+        audit("job.finished", jobId=job.id, customerId=job.customer_id, ok=job.ok, failed=job.failed, exported=0 if options.get("api_key_only") else len(exported_all), apiKeys=len(api_keys_all), path=str(out_path) if out_path else None, apiKeysPath=job.api_keys_path or None, apiKeyOnly=options.get("api_key_only"))
+    except Exception as exc:
+        job.status = "failed"
+        job.error = str(exc)
+        job.log(f"任务失败：{exc}")
+        audit("job.failed", jobId=job.id, customerId=job.customer_id, error=str(exc))
+    finally:
+        job.finished_at = time.time()
+        save_job_history()
+
+
+def job_to_dict(job: Job) -> dict[str, Any]:
+    with JOBS_LOCK:
+        return {
+            "id": job.id,
+            "status": job.status,
+            "total": job.total,
+            "done": job.done,
+            "ok": job.ok,
+            "failed": job.failed,
+            "error": job.error,
+            "logs": list(job.logs),
+            "downloadReady": bool(job.export_path and Path(job.export_path).exists()),
+            "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
+            "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
+            "createdAt": int(job.created_at),
+            "finishedAt": int(job.finished_at or 0),
+            "results": [
+                {
+                    "idx": r.idx,
+                    "email": r.email,
+                    "ok": r.ok,
+                    "message": r.message,
+                    "changedPassword": r.changed_password,
+                    "exportedCount": len(r.exported),
+                    "apiKeyCount": len(r.api_keys),
+                }
+                for r in job.results
+            ],
+        }
+
+
+def customer_history(customer_id: str) -> list[dict[str, Any]]:
+    cleanup_expired_jobs()
+    rows: list[dict[str, Any]] = []
+    with JOBS_LOCK:
+        jobs = sorted(
+            (job for job in JOBS.values() if job.customer_id == customer_id),
+            key=lambda item: item.finished_at or item.created_at,
+            reverse=True,
+        )
+        for job in jobs[:20]:
+            age_base = job.finished_at or time.time()
+            rows.append({
+                "id": job.id,
+                "status": job.status,
+                "ok": job.ok,
+                "failed": job.failed,
+                "done": job.done,
+                "total": job.total,
+                "createdAt": int(job.created_at),
+                "finishedAt": int(job.finished_at or 0),
+                "expiresIn": None if not job.finished_at else max(0, int(EXPORT_TTL_SECONDS - (time.time() - age_base))),
+                "downloadReady": bool(job.export_path and Path(job.export_path).exists()),
+                "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
+                "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
+            })
+    return rows
+
+
+def delete_job_files(job: Job) -> list[str]:
+    deleted: list[str] = []
+    for path_attr in ("export_path", "api_keys_path", "log_path"):
+        path_value = getattr(job, path_attr, "")
+        if path_value:
+            try:
+                Path(path_value).unlink(missing_ok=True)
+                deleted.append(path_attr)
+            except Exception as exc:
+                audit("job.file_delete_failed", jobId=job.id, customerId=job.customer_id, path=path_value, error=str(exc))
+            setattr(job, path_attr, "")
+    return deleted
+
+
+def active_job_counts(customer_id: str) -> tuple[int, int, int]:
+    with JOBS_LOCK:
+        active = [job for job in JOBS.values() if job.status in {"queued", "running"}]
+        customer_active = sum(1 for job in active if job.customer_id == customer_id)
+        browser_slots = sum(max(1, job.threads) for job in active)
+        return customer_active, len(active), browser_slots
+
+
+@app.get("/login")
+def login_page():
+    if current_customer_id():
+        return redirect(url_for("index"))
+    return render_template("login.html", error="")
+
+
+@app.post("/login")
+def login_submit():
+    password = request.form.get("password", "")
+    customer_name = request.form.get("customer_name", "")
+    ok, error = valid_custom_password(password)
+    if not ok:
+        audit("auth.invalid_password", ip=client_ip(), reason=error)
+        return render_template("login.html", error=error), 400
+    customer = customer_for_password(password)
+    created = False
+    if not customer:
+        customer = create_customer_for_password(password, customer_name)
+        created = True
+        audit("customer.created", customerId=customer["id"], customerName=customer["name"], ip=client_ip())
+    elif customer_name.strip():
+        customer["name"] = update_customer_name(customer["id"], customer_name)
+        audit("customer.renamed", customerId=customer["id"], customerName=customer["name"], ip=client_ip())
+    session["customer_id"] = customer["id"]
+    session["customer_name"] = customer["name"]
+    audit("auth.login", customerId=customer["id"], customerName=customer["name"], created=created, ip=client_ip())
+    return redirect(url_for("index"))
+
+
+@app.post("/logout")
+def logout():
+    audit("auth.logout", customerId=current_customer_id(), ip=client_ip())
+    session.clear()
+    return redirect(url_for("login_page"))
+
+
+@app.get("/")
+def index():
+    if not current_customer_id():
+        return redirect(url_for("login_page"))
+    return render_template(
+        "index.html",
+        default_start_url=DEFAULT_START_URL,
+        default_new_password=DEFAULT_NEW_PASSWORD,
+        customer_name=current_customer_name(),
+        export_ttl_seconds=EXPORT_TTL_SECONDS,
+    )
+
+
+@app.post("/api/jobs")
+def create_job():
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    payload = request.get_json(force=True)
+    accounts = parse_accounts(payload.get("accounts", ""))
+    if not accounts:
+        return jsonify({"error": "没有解析到账号，请按 email:password 每行一个填写"}), 400
+    if len(accounts) > MAX_ACCOUNTS_PER_JOB:
+        return jsonify({"error": f"单次最多提交 {MAX_ACCOUNTS_PER_JOB} 个账号"}), 400
+    customer_active, global_active, browser_slots = active_job_counts(customer_id)
+    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
+        return jsonify({"error": f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"}), 429
+    if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
+        return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
+    raw_start_url = (payload.get("startUrl") or "").strip()
+    ok_start_url, start_url_or_error = validate_start_url(raw_start_url)
+    if not ok_start_url:
+        return jsonify({"error": start_url_or_error}), 400
+    create_api_keys = bool(payload.get("createApiKeys", False))
+    api_key_only = bool(payload.get("apiKeyOnly", False))
+    if create_api_keys and api_key_only:
+        return jsonify({"error": "同步创建 API Key 和仅创建 API Key 不能同时开启"}), 400
+    job_id = secrets.token_hex(8)
+    job = Job(id=job_id, customer_id=customer_id, total=len(accounts))
+    threads = max(1, min(int(payload.get("threads") or 3), MAX_THREADS_PER_JOB, len(accounts)))
+    if browser_slots + threads > MAX_BROWSER_SLOTS_GLOBAL:
+        return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
+    job.threads = threads
+    login_timeout = max(60, min(int(payload.get("loginTimeout") or 180), 600))
+    options = {
+        "start_url": start_url_or_error,
+        "oidc_region": dca.normalize_oidc_region(payload.get("oidcRegion") or dca.DEFAULT_OIDC_REGION),
+        "kiro_region": dca.normalize_kiro_region(payload.get("kiroRegion") or dca.DEFAULT_KIRO_REGION),
+        "new_password": payload.get("newPassword") or DEFAULT_NEW_PASSWORD,
+        "headless": True,
+        "threads": threads,
+        "login_timeout": login_timeout,
+        "create_api_keys": create_api_keys,
+        "api_key_only": api_key_only,
+        "api_key_label": (payload.get("apiKeyLabel") or "1").strip()[:80] or "1",
+        "strict_probe": bool(payload.get("strictProbe", False)),
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    save_job_history()
+    audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], ip=client_ip())
+    thread = threading.Thread(target=run_job, args=(job, accounts, options), daemon=True)
+    thread.start()
+    return jsonify({"jobId": job_id})
+
+
+@app.post("/api/json-api-keys")
+def create_json_api_key_job():
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    if "zip" not in request.files:
+        return jsonify({"error": "请上传 ZIP 文件"}), 400
+    try:
+        rows = load_json_credentials_from_zip(request.files["zip"])
+    except zipfile.BadZipFile:
+        return jsonify({"error": "ZIP 文件格式不正确"}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    customer_active, global_active, _browser_slots = active_job_counts(customer_id)
+    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
+        return jsonify({"error": f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"}), 429
+    if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
+        return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
+    threads = max(1, min(int(request.form.get("threads") or 5), MAX_THREADS_PER_JOB, len(rows)))
+    label = (request.form.get("apiKeyLabel") or "1").strip()[:80] or "1"
+    job_id = secrets.token_hex(8)
+    job = Job(id=job_id, customer_id=customer_id, total=len(rows), threads=threads)
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    save_job_history()
+    audit("json_apikey_job.created", jobId=job_id, customerId=customer_id, total=len(rows), threads=threads, ip=client_ip())
+    thread = threading.Thread(target=run_json_api_key_job, args=(job, rows, {"threads": threads, "api_key_label": label}), daemon=True)
+    thread.start()
+    return jsonify({"jobId": job_id})
+
+
+@app.get("/api/jobs/<job_id>")
+def get_job(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    job = JOBS.get(job_id)
+    if not job or job.customer_id != customer_id:
+        return jsonify({"error": "任务不存在"}), 404
+    return jsonify(job_to_dict(job))
+
+
+@app.get("/api/history")
+def get_history():
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    return jsonify({"items": customer_history(customer_id)})
+
+
+@app.delete("/api/jobs/<job_id>")
+def delete_job(job_id: str):
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job or job.customer_id != customer_id:
+            return jsonify({"error": "记录不存在"}), 404
+        if job.status in {"queued", "running"}:
+            return jsonify({"error": "任务运行中，暂不能删除"}), 409
+        deleted = delete_job_files(job)
+        JOBS.pop(job_id, None)
+    audit("job.deleted", jobId=job_id, customerId=customer_id, deleted=deleted, ip=client_ip())
+    save_job_history()
+    return jsonify({"ok": True, "deleted": deleted})
+
+
+@app.get("/api/jobs/<job_id>/download")
+def download_job(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    job = JOBS.get(job_id)
+    if not job or job.customer_id != customer_id or not job.export_path or not Path(job.export_path).exists():
+        return jsonify({"error": "导出文件不存在"}), 404
+    audit("export.download", jobId=job.id, customerId=customer_id, path=job.export_path, ip=client_ip())
+    return send_file(job.export_path, mimetype="application/json", as_attachment=True, download_name=f"kiro-login-export-{job_id}.json")
+
+
+@app.get("/api/jobs/<job_id>/api-keys/download")
+def download_job_api_keys(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    job = JOBS.get(job_id)
+    if not job or job.customer_id != customer_id or not job.api_keys_path or not Path(job.api_keys_path).exists() or Path(job.api_keys_path).stat().st_size <= 0:
+        return jsonify({"error": "API Key 文件不存在"}), 404
+    audit("apikeys.download", jobId=job.id, customerId=customer_id, path=job.api_keys_path, ip=client_ip())
+    return send_file(job.api_keys_path, mimetype="text/plain", as_attachment=True, download_name=f"kiro-api-keys-{job_id}.txt")
+
+
+@app.get("/api/jobs/<job_id>/logs/download")
+def download_job_logs(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    job = JOBS.get(job_id)
+    if not job or job.customer_id != customer_id or not job.log_path or not Path(job.log_path).exists():
+        return jsonify({"error": "日志文件不存在"}), 404
+    audit("joblog.download", jobId=job.id, customerId=customer_id, path=job.log_path, ip=client_ip())
+    return send_file(job.log_path, mimetype="text/plain", as_attachment=True, download_name=f"kiro-job-log-{job_id}.txt")
+
+
+def main() -> None:
+    restore_job_history()
+    restore_jobs_from_exports()
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7888)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

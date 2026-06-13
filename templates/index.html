@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Kiro 登录工具</title>
+  <style>
+    :root{
+      color-scheme:dark;
+      --bg:#070a11; --bg2:#0b1020; --panel:rgba(15,23,42,.78); --panel2:rgba(2,6,23,.72);
+      --line:rgba(148,163,184,.18); --line2:rgba(148,163,184,.28); --text:#eef2ff; --muted:#94a3b8;
+      --brand:#60a5fa; --brand2:#22c55e; --bad:#fb7185; --warn:#fbbf24; --ok:#86efac;
+      --shadow:0 28px 90px rgba(0,0,0,.42); --radius:24px; --radius2:16px;
+    }
+    *{box-sizing:border-box} html{min-height:100%;background:var(--bg)}
+    body{margin:0;min-height:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 10% -10%,rgba(96,165,250,.24),transparent 34%),radial-gradient(circle at 92% 6%,rgba(34,197,94,.16),transparent 30%),linear-gradient(180deg,#070a11,#0b1020 52%,#070a11)}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);background-size:44px 44px;mask-image:linear-gradient(to bottom,rgba(0,0,0,.75),transparent)}
+    main{max-width:1360px;margin:0 auto;padding:10px 12px 18px;position:relative}
+    .topbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px}
+    .eyebrow{display:inline-flex;align-items:center;gap:8px;color:#bfdbfe;background:rgba(96,165,250,.11);border:1px solid rgba(96,165,250,.2);border-radius:999px;padding:4px 8px;font-size:10px;font-weight:750}
+    h1{margin:5px 0 0;font-size:clamp(24px,3.2vw,34px);line-height:1;letter-spacing:-.045em}
+    .subtitle{display:none;max-width:760px;margin:0;color:var(--muted);font-size:12px;line-height:1.35}
+    .session{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+    .pill,.badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:rgba(15,23,42,.72);border-radius:999px;padding:7px 11px;color:#cbd5e1;font-size:12px;font-weight:750;white-space:nowrap}
+    .shell{display:grid;grid-template-columns:minmax(0,1.04fr) minmax(390px,.96fr);gap:10px;align-items:start}
+    .card{background:linear-gradient(180deg,rgba(15,23,42,.86),rgba(2,6,23,.72));border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);backdrop-filter:blur(18px);overflow:hidden}
+    .card-head{display:flex;justify-content:space-between;gap:8px;align-items:center;padding:10px 14px 8px;border-bottom:1px solid var(--line)}
+    .card-title{margin:0;font-size:15px;letter-spacing:-.02em}.card-desc{display:none;margin:2px 0 0;color:var(--muted);font-size:10px;line-height:1.25}
+    .card-body{padding:10px 14px 12px}.stack{display:grid;gap:8px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+    label{display:block;margin:0 0 5px;color:#dbeafe;font-size:11px;font-weight:800;letter-spacing:.02em}
+    textarea,input,select{width:100%;border:1px solid rgba(148,163,184,.24);background:rgba(2,6,23,.72);color:var(--text);border-radius:12px;padding:9px 11px;font-size:13px;outline:none;transition:border-color .18s,box-shadow .18s,background .18s}
+    textarea{min-height:132px;resize:vertical;font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,monospace;line-height:1.4}
+    textarea:focus,input:focus,select:focus{border-color:rgba(96,165,250,.78);box-shadow:0 0 0 4px rgba(96,165,250,.13);background:rgba(2,6,23,.92)}
+    .hint{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.35}.micro{color:#64748b;font-size:10px}.divider{height:1px;background:var(--line);margin:8px 0}
+    details.advanced{border:1px solid var(--line);border-radius:14px;background:rgba(2,6,23,.32);overflow:hidden}details.advanced>summary{cursor:pointer;list-style:none;padding:8px 10px;color:#cbd5e1;font-size:12px;font-weight:850;display:flex;justify-content:space-between;align-items:center}details.advanced>summary::-webkit-details-marker{display:none}details.advanced>summary:after{content:'展开';color:var(--muted);font-size:11px;font-weight:700}details.advanced[open]>summary:after{content:'收起'}details.advanced .advanced-body{padding:0 10px 10px;display:grid;gap:8px}
+    .checkgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.checkline{display:flex;gap:7px;align-items:center;margin:0;padding:7px 8px;border:1px solid var(--line);border-radius:12px;background:rgba(2,6,23,.36);color:#cbd5e1;font-size:11px;font-weight:750;line-height:1.2}.checkline input{width:auto;margin-top:0}.checkline br,.checkline .micro{display:none}
+    .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:2px}button,.button{border:0;border-radius:12px;padding:9px 13px;background:rgba(51,65,85,.86);color:white;font-weight:850;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;transition:transform .15s,opacity .15s,background .15s}button:hover,.button:hover{transform:translateY(-1px)}button:disabled{opacity:.55;cursor:not-allowed;transform:none}.primary{background:linear-gradient(135deg,#3b82f6,#22c55e)}.secondary{background:rgba(30,41,59,.92)}
+    .status{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.metric{border:1px solid var(--line);border-radius:15px;padding:10px;background:rgba(2,6,23,.52)}.metric strong{display:block;font-size:18px;letter-spacing:-.03em}.metric span{color:var(--muted);font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.05em}
+    .progress{height:8px;border-radius:999px;background:rgba(2,6,23,.8);border:1px solid var(--line);overflow:hidden;margin:10px 0}.progress>div{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#22c55e);transition:width .25s ease}
+    .logbox{min-height:150px;max-height:230px;overflow:auto;background:rgba(2,6,23,.62);border:1px solid var(--line);border-radius:15px;padding:7px;font-size:11px;line-height:1.35}.log-line{display:grid;grid-template-columns:50px minmax(0,1fr);gap:6px;padding:4px 6px;border-radius:9px;color:#cbd5e1}.log-line:nth-child(odd){background:rgba(148,163,184,.04)}.log-time{color:#64748b;font-family:ui-monospace,monospace}.log-msg{min-width:0;overflow-wrap:anywhere}.log-ok{color:var(--ok)}.log-fail{color:#fda4af}.log-warn{color:#fde68a}
+    table{width:100%;border-collapse:separate;border-spacing:0;margin-top:8px;font-size:12px;overflow:hidden;border:1px solid var(--line);border-radius:14px}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}tr:last-child td{border-bottom:0}th{color:#cbd5e1;background:rgba(15,23,42,.56);font-size:11px}.ok{color:var(--ok)}.fail{color:var(--bad)}.muted{color:var(--muted)}.run{color:#93c5fd}.badge.ok{color:var(--ok);border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}.badge.fail{color:#fda4af;border-color:rgba(251,113,133,.35);background:rgba(251,113,133,.08)}.badge.run{color:#93c5fd;border-color:rgba(96,165,250,.35);background:rgba(96,165,250,.08)}
+    .mobile-actions{display:none}.sticky-run{position:static;margin:0;padding:0;background:transparent;border-top:0;backdrop-filter:none}
+    @media(min-width:981px){.upload-compact{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr) auto;gap:8px;align-items:end}.results-meta{margin:8px 0 5px!important}.desktop-inline{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}}
+    @media(max-width:980px){main{padding:14px 10px 24px}.topbar{display:block}.session{justify-content:flex-start;margin-top:10px}.shell{grid-template-columns:1fr}.grid2,.checkgrid{grid-template-columns:1fr}.status{grid-template-columns:repeat(2,1fr)}textarea{min-height:180px}.card-head,.card-body{padding-left:13px;padding-right:13px}.actions .button{flex:1}.primary{width:100%}.logbox{min-height:190px;max-height:320px}.desktop-only{display:none}.mobile-actions{display:flex;gap:8px;overflow-x:auto;padding-bottom:2px}.mobile-actions .button{white-space:nowrap;flex:0 0 auto}table{font-size:12px}th,td{padding:8px 6px}.topbar h1{font-size:30px}}
+  </style>
+</head>
+<body>
+<main>
+  <header class="topbar">
+    <div>
+      <span class="eyebrow">Kiro Login Tool · 高速批量登录</span>
+      <h1>Kiro 登录工具</h1>
+      <p class="subtitle">粘贴账号、填写 IDC Start URL，一键登录、检查可用性并导出 JSON 或 API Key。前台只显示关键状态，完整日志/文件保留 60 分钟。</p>
+    </div>
+    <form class="session" method="post" action="/logout">
+      <span class="pill">{{ customer_name }}</span>
+      <button class="secondary" type="submit">退出</button>
+    </form>
+  </header>
+
+  <div class="shell">
+    <section class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">提交任务</h2><p class="card-desc">推荐先 1-3 并发确认账号质量，再提高并发批量处理。</p></div>
+        <span class="pill">保留 {{ export_ttl_seconds // 60 }} 分钟</span>
+      </div>
+      <div class="card-body stack">
+        <div>
+          <label>账号列表</label>
+          <textarea id="accounts" placeholder="每行一个：&#10;user@example.com:Password123&#10;user2@example.com|Password123|http://proxy:8080"></textarea>
+          <div class="hint">支持 email:password / email|password|proxy / CSV / Tab。</div>
+        </div>
+
+        <div class="grid2">
+          <div><label>IDC Start URL</label><input id="startUrl" value="" placeholder="{{ default_start_url }}" required></div>
+          <div><label>首次登录新密码</label><input id="newPassword" value="{{ default_new_password }}"></div>
+        </div>
+        <div class="desktop-inline">
+          <div class="grid2 compact-fields">
+            <div><label>并行登录数</label><select id="threads"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option>10</option></select></div>
+            <div><label>单账号超时</label><input id="loginTimeout" type="number" min="60" max="600" step="10" value="180"></div>
+          </div>
+          <div class="grid2 compact-fields">
+            <div><label>OIDC Region</label><select id="oidcRegion"><option>us-east-1</option><option>eu-central-1</option><option>eu-west-1</option><option>ap-southeast-1</option></select></div>
+            <div><label>Kiro Region</label><select id="kiroRegion"><option>eu-central-1</option><option>us-east-1</option><option>eu-west-1</option><option>ap-southeast-1</option></select></div>
+          </div>
+        </div>
+
+        <div class="checkgrid">
+          <label class="checkline"><input id="createApiKeys" type="checkbox"><span>同步创建 API Key<br><span class="micro">生成 JSON + rawKey 文件</span></span></label>
+          <label class="checkline"><input id="apiKeyOnly" type="checkbox"><span>仅创建 API Key<br><span class="micro">不生成凭据 JSON</span></span></label>
+          <label class="checkline"><input id="strictProbe" type="checkbox"><span>严格可用性探测<br><span class="micro">默认关闭；开启会更慢但可提前发现封禁</span></span></label>
+        </div>
+        <div class="run-row">
+          <div id="apiKeyOptions" style="display:none"><label>API Key 标签</label><input id="apiKeyLabel" value="1" maxlength="80"></div>
+          <div class="sticky-run">
+            <div class="actions">
+              <button id="start" class="primary">开始登录</button>
+              <a id="download" class="button secondary" href="#" style="display:none">JSON</a>
+              <a id="downloadApiKeys" class="button secondary" href="#" style="display:none">API Key</a>
+              <a id="downloadLogs" class="button secondary" href="#" style="display:none">日志</a>
+            </div>
+          </div>
+        </div>
+
+        <details class="advanced">
+          <summary>高级：上传 JSON ZIP 开通 API Key</summary>
+          <div class="advanced-body upload-compact">
+            <div>
+              <label>JSON ZIP</label>
+              <input id="jsonZip" type="file" accept=".zip,application/zip">
+            </div>
+            <div class="grid2">
+              <div><label>Key 标签</label><input id="jsonApiKeyLabel" value="1" maxlength="80"></div>
+              <div><label>并发</label><select id="jsonThreads"><option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option><option>6</option><option>8</option><option>10</option></select></div>
+            </div>
+            <div class="actions"><button id="startJsonApiKeys" class="secondary" type="button">开通 Key</button></div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">运行状态</h2><p class="card-desc">实时进度、简化日志和历史下载都在这里。</p></div>
+        <span class="pill" id="jobId">未开始</span>
+      </div>
+      <div class="card-body">
+        <div class="status">
+          <div class="metric"><strong id="mStatus">-</strong><span>状态</span></div>
+          <div class="metric"><strong id="mDone">0/0</strong><span>进度</span></div>
+          <div class="metric"><strong id="mOk">0</strong><span>成功</span></div>
+          <div class="metric"><strong id="mFail">0</strong><span>失败</span></div>
+        </div>
+        <div class="progress"><div id="progressBar"></div></div>
+        <div class="mobile-actions">
+          <a id="downloadMobile" class="button secondary" href="#" style="display:none">JSON</a>
+          <a id="downloadApiKeysMobile" class="button secondary" href="#" style="display:none">API Key</a>
+          <a id="downloadLogsMobile" class="button secondary" href="#" style="display:none">日志</a>
+        </div>
+        <div id="logs" class="logbox"></div>
+        <table id="results" style="display:none"><thead><tr><th>#</th><th>账号</th><th>结果</th><th>导出</th></tr></thead><tbody></tbody></table>
+        <div class="results-meta" style="display:flex;justify-content:space-between;align-items:center;margin:18px 0 8px;gap:10px"><span class="pill">历史记录</span><span class="muted">文件 60 分钟后过期</span></div>
+        <table id="history" style="display:none"><thead><tr><th>任务</th><th>结果</th><th>剩余</th><th>下载/操作</th></tr></thead><tbody></tbody></table>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+let currentJob=null,timer=null;const $=id=>document.getElementById(id);const DEFAULT_START_URL={{ default_start_url|tojson }};
+function escapeHtml(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+function startUrlValue(){return ($('startUrl')&&$('startUrl').value.trim())||'';}
+function payload(){const createApiKeys=$('createApiKeys').checked,apiKeyOnly=$('apiKeyOnly').checked;return{accounts:$('accounts').value,startUrl:startUrlValue(),newPassword:$('newPassword').value,oidcRegion:$('oidcRegion').value,kiroRegion:$('kiroRegion').value,createApiKeys,apiKeyOnly,strictProbe:$('strictProbe').checked,apiKeyLabel:$('apiKeyLabel').value,threads:Number($('threads').value||3),loginTimeout:Number($('loginTimeout').value||180)}}
+function setBusy(b){$('start').disabled=b;$('start').textContent=b?'运行中...':'开始登录';}
+function setDownloads(json,key,log,id){[['download',json,'/download'],['downloadMobile',json,'/download'],['downloadApiKeys',key,'/api-keys/download'],['downloadApiKeysMobile',key,'/api-keys/download'],['downloadLogs',log,'/logs/download'],['downloadLogsMobile',log,'/logs/download']].forEach(([el,on,path])=>{const a=$(el);if(!a)return;if(on&&id){a.href='/api/jobs/'+id+path;a.style.display='inline-flex'}else{a.style.display='none'}})}
+function formatCountdown(s){if(s===null||s===undefined)return'运行中';s=Math.max(0,Number(s)||0);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}
+function setLogText(t){$('logs').textContent=t}function renderLogs(lines){const box=$('logs');box.innerHTML='';(lines||[]).forEach(line=>{const m=String(line).match(/^\[([^\]]+)\]\s*(.*)$/);const time=m?m[1]:'';const msg=m?m[2]:String(line);const row=document.createElement('div');row.className='log-line';if(/成功|完成|授权成功|API Key 创建成功/.test(msg))row.classList.add('log-ok');if(/失败|错误|超时|未获取|不匹配|暂停|拒绝|失效/.test(msg))row.classList.add('log-fail');if(/重试|等待|验证码|已扫描|检查/.test(msg))row.classList.add('log-warn');row.innerHTML=`<span class="log-time">${escapeHtml(time)}</span><span class="log-msg">${escapeHtml(msg)}</span>`;box.appendChild(row)});box.scrollTop=box.scrollHeight}
+function statusLabel(s){return{queued:'排队',running:'运行中',finished:'完成',failed:'失败',expired:'已过期',lost:'已失效'}[s]||s||'-'}function updateMetrics(d){const total=Number(d.total||0),done=Number(d.done||0);$('mStatus').textContent=statusLabel(d.status);$('mDone').textContent=`${done}/${total}`;$('mOk').textContent=d.ok;$('mFail').textContent=d.failed;$('progressBar').style.width=(total?Math.round(done*100/total):0)+'%'}
+async function startJob(){if(!startUrlValue()){setLogText('错误：IDC Start URL 必填');$('startUrl').focus();return}setBusy(true);setDownloads(false,false,false);setLogText('提交任务...');try{const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});if(r.status===401){location.href='/login';return}const d=await r.json();if(!r.ok)throw new Error(d.error||'提交失败');currentJob=d.jobId;$('jobId').textContent='任务 '+currentJob;if(timer)clearInterval(timer);timer=setInterval(poll,1500);poll()}catch(e){setBusy(false);setLogText('错误：'+e.message)}}
+async function startJsonApiKeys(){const file=$('jsonZip').files&&$('jsonZip').files[0];if(!file){setLogText('错误：请先选择 JSON ZIP 文件');$('jsonZip').focus();return}setBusy(true);setDownloads(false,false,false);setLogText('提交 JSON API Key 任务...');try{const form=new FormData();form.append('zip',file);form.append('apiKeyLabel',$('jsonApiKeyLabel').value||'1');form.append('threads',$('jsonThreads').value||'5');const r=await fetch('/api/json-api-keys',{method:'POST',body:form});if(r.status===401){location.href='/login';return}const d=await r.json();if(!r.ok)throw new Error(d.error||'提交失败');currentJob=d.jobId;$('jobId').textContent='任务 '+currentJob;if(timer)clearInterval(timer);timer=setInterval(poll,1500);poll()}catch(e){setBusy(false);setLogText('错误：'+e.message)}}
+async function poll(){if(!currentJob)return;const r=await fetch('/api/jobs/'+currentJob);if(r.status===401){location.href='/login';return}if(r.status===404){if(timer)clearInterval(timer);setBusy(false);updateMetrics({status:'lost',done:0,total:0,ok:0,failed:0});setLogText('任务记录已失效，可能是服务刚重启。请查看历史记录，必要时重新提交。');currentJob=null;loadHistory();return}const d=await r.json();updateMetrics(d);renderLogs((d.logs||[]).slice(-24));const tbody=$('results').querySelector('tbody');tbody.innerHTML='';$('results').style.display=(d.results||[]).length?'table':'none';(d.results||[]).forEach(x=>{const tr=document.createElement('tr');tr.innerHTML=`<td>${escapeHtml(x.idx)}</td><td>${escapeHtml(x.email)}</td><td class="${x.ok?'ok':'fail'}">${escapeHtml(x.message)}</td><td>${escapeHtml(x.exportedCount||0)}${x.apiKeyCount?` / Key ${escapeHtml(x.apiKeyCount)}`:''}</td>`;tbody.appendChild(tr)});if(['finished','failed'].includes(d.status)){clearInterval(timer);setBusy(false);setDownloads(d.downloadReady,d.apiKeysDownloadReady,d.logDownloadReady,currentJob);loadHistory()}}
+async function deleteHistoryJob(id){if(!confirm('确认删除这条历史记录和已生成的下载文件？'))return;const r=await fetch('/api/jobs/'+encodeURIComponent(id),{method:'DELETE'});const d=await r.json().catch(()=>({}));if(!r.ok){alert(d.error||'删除失败');return}if(currentJob===id){currentJob=null;$('jobId').textContent='未开始';setDownloads(false,false,false);setLogText('');updateMetrics({status:'-',done:0,total:0,ok:0,failed:0})}loadHistory()}
+async function loadHistory(){const r=await fetch('/api/history');if(r.status===401)return;const d=await r.json();const tbody=$('history').querySelector('tbody');tbody.innerHTML='';const items=d.items||[];$('history').style.display=items.length?'table':'none';if(!currentJob){const running=items.find(x=>['queued','running'].includes(x.status));if(running){currentJob=running.id;$('jobId').textContent='任务 '+currentJob;setBusy(true);if(timer)clearInterval(timer);timer=setInterval(poll,1500);poll()}}items.forEach(x=>{const links=[];if(x.downloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/download">JSON</a>`);if(x.apiKeysDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/api-keys/download">API Key</a>`);if(x.logDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/logs/download">日志</a>`);if(!['queued','running'].includes(x.status))links.push(`<button class="secondary" type="button" onclick="deleteHistoryJob('${escapeHtml(x.id)}')">删除</button>`);const cls=x.status==='finished'?'ok':(x.status==='failed'?'fail':'run');const progress=x.status==='running'||x.status==='queued'?` · ${escapeHtml(x.done||0)}/${escapeHtml(x.total||0)}`:'';const tr=document.createElement('tr');tr.innerHTML=`<td>${escapeHtml(x.id)}</td><td><span class="badge ${cls}">${escapeHtml(statusLabel(x.status))}</span>${progress}<br>成功 ${escapeHtml(x.ok)} / 失败 ${escapeHtml(x.failed)}</td><td>${escapeHtml(formatCountdown(x.expiresIn))}</td><td>${links.join(' ')||'<span class="muted">等待/已过期</span>'}</td>`;tbody.appendChild(tr)})}
+function updateApiKeyOptions(){const on=$('createApiKeys').checked||$('apiKeyOnly').checked;$('apiKeyOptions').style.display=on?'block':'none'}
+function bindExclusiveApiKeyOptions(){
+  $('createApiKeys').addEventListener('change',()=>{if($('createApiKeys').checked)$('apiKeyOnly').checked=false;updateApiKeyOptions()});
+  $('apiKeyOnly').addEventListener('change',()=>{if($('apiKeyOnly').checked)$('createApiKeys').checked=false;updateApiKeyOptions()});
+}
+bindExclusiveApiKeyOptions();$('start').addEventListener('click',e=>{e.preventDefault();startJob()});$('startJsonApiKeys').addEventListener('click',e=>{e.preventDefault();startJsonApiKeys()});updateApiKeyOptions();loadHistory();setInterval(loadHistory,5000);
+</script>
+</body>
+</html>

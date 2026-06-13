@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+.flask-secret
+customers.json
+data/
+exports/
+logs/
+run.pid
+
+.env
+.env.*
+*.log
+*.sqlite
+*.db

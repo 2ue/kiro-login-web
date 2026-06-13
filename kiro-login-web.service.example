@@ -1,0 +1,15 @@
+[Unit]
+Description=Kiro Login Web
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/kiro-login-web
+Environment=KIRO_LOGIN_HOST=127.0.0.1
+Environment=KIRO_LOGIN_PORT=7888
+ExecStart=/root/.openclaw/workspace/kiro-login-web/run.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

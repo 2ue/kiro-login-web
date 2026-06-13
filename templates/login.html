@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kiro 登录工具 - 客户入口</title>
+  <style>
+    :root { color-scheme: dark; --bg:#080b12; --card:#111827; --muted:#94a3b8; --line:#263244; --text:#e5e7eb; --brand:#22c55e; --bad:#ef4444; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:radial-gradient(circle at top,#12203a 0,#080b12 48%); color:var(--text); padding:18px; }
+    .card { width:min(440px,100%); background:rgba(17,24,39,.9); border:1px solid var(--line); border-radius:20px; padding:24px; box-shadow:0 20px 80px rgba(0,0,0,.3); }
+    h1 { margin:0 0 8px; font-size:24px; }
+    p { margin:0 0 18px; color:var(--muted); line-height:1.6; }
+    label { display:block; margin:14px 0 6px; color:#cbd5e1; font-size:13px; font-weight:650; }
+    input { width:100%; border:1px solid #334155; background:#0b1220; color:var(--text); border-radius:12px; padding:12px; font-size:15px; outline:none; }
+    input:focus { border-color:#38bdf8; box-shadow:0 0 0 3px rgba(56,189,248,.14); }
+    button { width:100%; margin-top:16px; border:0; border-radius:12px; padding:12px 15px; background:linear-gradient(135deg,#22c55e,#16a34a); color:white; font-weight:750; cursor:pointer; }
+    .err { background:rgba(239,68,68,.12); border:1px solid rgba(239,68,68,.3); color:#fecaca; border-radius:12px; padding:10px 12px; margin-bottom:12px; }
+    .hint { color:var(--muted); font-size:12px; margin-top:12px; }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/login">
+    <h1>Kiro 批量登录导出</h1>
+    <p>输入你的专属密码即可进入；如果这个密码第一次使用，系统会自动创建一个新的独立客户空间。已存在的密码可填写客户名称来更新右上角显示名。</p>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    <label for="customer_name">客户名称（选填，可更新显示名）</label>
+    <input id="customer_name" name="customer_name" type="text" autocomplete="organization" placeholder="例如：客户A / 张三团队">
+    <label for="password">专属密码</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+    <button type="submit">进入 / 创建客户空间</button>
+    <div class="hint">密码至少 8 位，必须包含大写字母、小写字母和数字。请妥善保存：以后用同一个密码进入同一个客户空间。导出文件仅保留 60 分钟，过期自动删除。</div>
+  </form>
+</body>
+</html>

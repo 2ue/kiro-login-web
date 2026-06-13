@@ -1,0 +1,10 @@
+{
+  "customer-a": {
+    "name": "客户A",
+    "password": "给客户A的独立入口密码"
+  },
+  "customer-b": {
+    "name": "客户B",
+    "password": "给客户B的独立入口密码"
+  }
+}
