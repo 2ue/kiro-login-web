@@ -74,7 +74,11 @@
 
         <div class="grid2">
           <div><label>IDC Start URL</label><input id="startUrl" value="" placeholder="{{ default_start_url }}" required></div>
-          <div><label>首次登录新密码</label><input id="newPassword" value="{{ default_new_password }}"></div>
+          <div><label>密码模式</label><select id="passwordMode"><option value="fixed" selected>固定密码</option><option value="random">每号随机</option></select></div>
+        </div>
+        <div>
+          <label>首次登录新密码（固定模式使用）</label><input id="newPassword" value="{{ default_new_password }}">
+          <div class="hint">选择“每号随机”时，每个账号会生成不同强密码，并写入导出 JSON。</div>
         </div>
         <div class="desktop-inline">
           <div class="grid2 compact-fields">
@@ -159,7 +163,7 @@ let currentJob=null,timer=null;const $=id=>document.getElementById(id);const DEF
 function escapeHtml(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
 function startUrlValue(){return ($('startUrl')&&$('startUrl').value.trim())||'';}
 function maybeFillStartUrlFromAccounts(){const input=$('startUrl'),text=$('accounts').value||'';if(!input||input.value.trim())return;const m=text.match(/Default AWS access portal URL \(IPv4 only\):\s*(https?:\/\/\S+)/i)||text.match(/Dual-stack AWS access portal URL:\s*(https?:\/\/\S+)/i);if(m)input.value=m[1].trim();}
-function payload(){const createApiKeys=$('createApiKeys').checked,apiKeyOnly=$('apiKeyOnly').checked;return{accounts:$('accounts').value,startUrl:startUrlValue(),newPassword:$('newPassword').value,oidcRegion:$('oidcRegion').value,kiroRegion:$('kiroRegion').value,createApiKeys,apiKeyOnly,strictProbe:$('strictProbe').checked,apiKeyLabel:$('apiKeyLabel').value,threads:Number($('threads').value||3),loginTimeout:Number($('loginTimeout').value||180)}}
+function payload(){const createApiKeys=$('createApiKeys').checked,apiKeyOnly=$('apiKeyOnly').checked;return{accounts:$('accounts').value,startUrl:startUrlValue(),newPassword:$('newPassword').value,passwordMode:$('passwordMode').value,oidcRegion:$('oidcRegion').value,kiroRegion:$('kiroRegion').value,createApiKeys,apiKeyOnly,strictProbe:$('strictProbe').checked,apiKeyLabel:$('apiKeyLabel').value,threads:Number($('threads').value||3),loginTimeout:Number($('loginTimeout').value||180)}}
 function setBusy(b){$('start').disabled=b;$('start').textContent=b?'运行中...':'开始登录';const sb=$('stopJob');if(sb)sb.style.display=b?'inline-flex':'none';const rb=$('retryJob');if(b&&rb)rb.style.display='none';}
 function setDownloads(json,key,log,id,mfa,split){[['download',json,'/download'],['downloadMobile',json,'/download'],['downloadSplitMobile',split,'/download-split'],['downloadApiKeys',key,'/api-keys/download'],['downloadApiKeysMobile',key,'/api-keys/download'],['downloadMfa',mfa,'/mfa-secrets/download'],['downloadMfaMobile',mfa,'/mfa-secrets/download'],['downloadLogs',log,'/logs/download'],['downloadLogsMobile',log,'/logs/download']].forEach(([el,on,path])=>{const a=$(el);if(!a)return;if(on&&id){a.href='/api/jobs/'+id+path;a.style.display='inline-flex'}else{a.style.display='none'}})}
 function formatCountdown(s){if(s===null||s===undefined)return'运行中';s=Math.max(0,Number(s)||0);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}

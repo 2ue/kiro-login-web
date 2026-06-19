@@ -743,6 +743,12 @@ def safe_export_filename(value: str, fallback: str) -> str:
     return (name or fallback)[:80]
 
 
+def random_account_password() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    core = "".join(secrets.choice(alphabet) for _ in range(18))
+    return f"Kiro@{core}#"
+
+
 def build_split_export_zip(export_path: str, zip_path: str) -> int:
     exported = json.loads(Path(export_path).read_text(encoding="utf-8"))
     if not isinstance(exported, list):
@@ -1127,12 +1133,13 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         return AccountResult(acc.idx, acc.email, False, start.error)
 
     log("已获取登录 URL，开始浏览器登录")
+    new_password = random_account_password() if options.get("password_mode") == "random" else options["new_password"]
 
     outcome = idc.drive_login(
         start.verification_uri_complete,
         acc.email,
         acc.password,
-        options["new_password"],
+        new_password,
         log=log,
         headless=options["headless"],
         proxy=acc.proxy,
@@ -1171,7 +1178,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         )
 
     exported: list[dict[str, Any]] = []
-    export_password = options["new_password"] if outcome.changed_password else acc.password
+    export_password = new_password if outcome.changed_password else acc.password
     export_mfa_secret = outcome.mfa_secret or acc.mfa_secret
     for profile in profiles:
         check_error = check_profile_available(exp, profile, options.get("strict_probe", False))
@@ -1213,7 +1220,8 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
     out_dir.chmod(0o700)
     job.log_path = str(out_dir / f"kiro-job-log-{job.id}.txt")
     Path(job.log_path).touch(mode=0o600, exist_ok=True)
-    job.log(f"开始任务：账号 {len(accounts)} 个，并发 {threads}，单号超时 {options['login_timeout']} 秒")
+    password_mode_label = "每号随机" if options.get("password_mode") == "random" else "固定"
+    job.log(f"开始任务：账号 {len(accounts)} 个，并发 {threads}，单号超时 {options['login_timeout']} 秒，密码模式：{password_mode_label}")
     audit("job.started", jobId=job.id, customerId=job.customer_id, total=len(accounts), threads=threads, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"])
     exported_all: list[dict[str, Any]] = []
     api_keys_all: list[str] = []
@@ -1454,11 +1462,13 @@ def create_job():
         return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
     job.threads = threads
     login_timeout = max(60, min(int(payload.get("loginTimeout") or 180), 600))
+    password_mode = "random" if payload.get("passwordMode") == "random" else "fixed"
     options = {
         "start_url": start_url_or_error,
         "oidc_region": dca.normalize_oidc_region(payload.get("oidcRegion") or dca.DEFAULT_OIDC_REGION),
         "kiro_region": dca.normalize_kiro_region(payload.get("kiroRegion") or dca.DEFAULT_KIRO_REGION),
         "new_password": payload.get("newPassword") or DEFAULT_NEW_PASSWORD,
+        "password_mode": password_mode,
         "headless": True,
         "threads": threads,
         "login_timeout": login_timeout,
