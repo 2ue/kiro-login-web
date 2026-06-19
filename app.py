@@ -988,7 +988,6 @@ def run_json_api_key_job(job: Job, rows: list[dict[str, str]], options: dict[str
     threads = max(1, min(int(options.get("threads") or 3), MAX_THREADS_PER_JOB, len(rows)))
     job.threads = threads
     out_dir = Path(__file__).parent / "exports" / job.customer_id
-    debug_dir = Path(__file__).parent / "debug_mfa" / job.id / f"{acc.idx:03d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_dir.chmod(0o700)
     job.log_path = str(out_dir / f"kiro-job-log-{job.id}.txt")
@@ -1047,6 +1046,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     # 即使后续被取消/超时/AWS 卡住/进程崩溃，密钥也已安全保存到下面这个文件。
     # 文件名带 -early- 区分；最终绑定成功的密钥仍走原 kiro-mfa-secrets-{job}.txt。
     out_dir = Path(__file__).parent / "exports" / job.customer_id
+    debug_dir = Path(__file__).parent / "debug_mfa" / job.id / f"{acc.idx:03d}"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_dir.chmod(0o700)
