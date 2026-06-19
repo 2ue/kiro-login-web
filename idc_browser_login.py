@@ -227,6 +227,20 @@ def _click_button(page, texts, log, timeout=2500) -> bool:
                     return True
             except Exception:
                 pass
+    try:
+        btns = page.locator("button:visible, input[type=submit]:visible, [role=button]:visible")
+        for i in range(min(btns.count(), 12)):
+            b = btns.nth(i)
+            try:
+                label = " ".join(((b.inner_text(timeout=500) or b.get_attribute("value") or b.get_attribute("aria-label") or "").split()))
+                if label and any(t.lower() in label.lower() for t in texts):
+                    b.click(timeout=timeout)
+                    log(f"    -> click '{label}'")
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
     return False
 
 
@@ -453,10 +467,32 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
 
     def code_inputs():
         return page.locator(
-            "input[type=text]:visible, input[type=tel]:visible, "
+            "input[type=text]:visible:not([readonly]):not([disabled]), "
+            "input[type=tel]:visible:not([readonly]):not([disabled]), "
             "input[name*=code i]:visible, input[name*=otp i]:visible, "
             "input[name*=mfa i]:visible"
         )
+
+    def fresh_totp() -> str:
+        # 避免在 TOTP 周期末尾提交，AWS 页面/网络稍慢就会过期。
+        remaining = 30 - (int(_t.time()) % 30)
+        if remaining <= 8:
+            log(f"    MFA: 当前验证码即将过期，等 {remaining + 1}s 换新码")
+            _t.sleep(remaining + 1)
+        return mfa_totp.totp_now(secret)
+
+    def fill_code(index: int, value: str) -> bool:
+        try:
+            loc = code_inputs().nth(index)
+            loc.click(timeout=2000)
+            loc.fill("")
+            loc.type(value, delay=20)
+            try:
+                return (loc.input_value(timeout=500) or "").strip() == value
+            except Exception:
+                return True
+        except Exception:
+            return False
 
     def still_on_mfa() -> bool:
         try:
@@ -527,31 +563,31 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
             page.wait_for_timeout(700)
             continue
 
-        code = mfa_totp.totp_now(secret)
+        code = fresh_totp()
         if n >= 2:
             # 两框同屏：第一个填当前码，第二个等下一周期再填
-            try:
-                code_inputs().nth(0).fill(code)
-            except Exception:
-                pass
+            fill_code(0, code)
             wait = 31 - (int(_t.time()) % 30)
             log(f"    MFA: 需第二个连续码，等 {wait}s 到下一周期")
             _t.sleep(min(wait, 32))
             code2 = mfa_totp.totp_now(secret)
-            try:
-                code_inputs().nth(1).fill(code2)
-            except Exception:
-                pass
+            fill_code(1, code2)
         else:
-            try:
-                code_inputs().nth(0).fill(code)
-            except Exception:
+            if not fill_code(0, code):
                 return False, secret
 
         shot(f"mfa_code_filled_{attempt}")
-        _click_button(page, ["Assign MFA", "Add MFA", "Register", "Confirm",
-                             "Verify", "Submit", "Continue", "Next", "绑定", "确认", "提交"], log)
-        page.wait_for_timeout(1600)
+        clicked = _click_button(page, ["Assign MFA", "Add MFA", "Register", "Confirm",
+                                       "Verify", "Submit", "Submit code", "Verify code",
+                                       "Continue", "Next", "Done", "Finish",
+                                       "绑定", "确认", "提交", "继续", "完成"], log)
+        if not clicked:
+            try:
+                code_inputs().nth(min(n - 1, 1)).press("Enter")
+                log("    MFA: 未找到提交按钮，已按 Enter 兜底")
+            except Exception:
+                pass
+        page.wait_for_timeout(2500)
         shot(f"mfa_after_submit_{attempt}")
 
         # —— 校验：是否真的被接受 ——

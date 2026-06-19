@@ -956,6 +956,7 @@ def run_json_api_key_job(job: Job, rows: list[dict[str, str]], options: dict[str
     threads = max(1, min(int(options.get("threads") or 3), MAX_THREADS_PER_JOB, len(rows)))
     job.threads = threads
     out_dir = Path(__file__).parent / "exports" / job.customer_id
+    debug_dir = Path(__file__).parent / "debug_mfa" / job.id / f"{acc.idx:03d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_dir.chmod(0o700)
     job.log_path = str(out_dir / f"kiro-job-log-{job.id}.txt")
@@ -1069,6 +1070,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         timeout_s=options["login_timeout"],
         window_index=acc.idx - 1,
         window_count=options["threads"],
+        debug_dir=str(debug_dir),
         stop_event=job.stop_event,
         mfa_secret=acc.mfa_secret,
         on_secret=_save_mfa_early,
