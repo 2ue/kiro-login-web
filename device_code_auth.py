@@ -56,7 +56,7 @@ BUILDER_ID_START_URL = "https://view.awsapps.com/start"
 #   (IDC d-9066713dd7 thuong la us-east-1). Dung eu-central-1 o day -> HTTP 400 invalid_request.
 # - Kiro Q API (quota 9router / ListAvailableProfiles): eu-central-1 cho workspace EU.
 DEFAULT_OIDC_REGION = "us-east-1"
-DEFAULT_KIRO_REGION = "eu-central-1"
+DEFAULT_KIRO_REGION = "us-east-1"
 REGION_OPTIONS = (
     "us-east-1",
     "eu-central-1",

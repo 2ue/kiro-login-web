@@ -284,7 +284,7 @@ def cleanup_expired_jobs() -> None:
         for job_id in list(JOBS):
             job = JOBS[job_id]
             expired = bool(job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS)
-            for path_attr, event_name in (("export_path", "export.expired_deleted"), ("api_keys_path", "apikeys.expired_deleted"), ("log_path", "joblog.expired_deleted")):
+            for path_attr, event_name in (("export_path", "export.expired_deleted"), ("export_split_zip_path", "export_split.expired_deleted"), ("api_keys_path", "apikeys.expired_deleted"), ("log_path", "joblog.expired_deleted")):
                 path_value = getattr(job, path_attr, "")
                 if path_value and expired:
                     try:
@@ -293,7 +293,7 @@ def cleanup_expired_jobs() -> None:
                     except Exception:
                         pass
                     setattr(job, path_attr, "")
-            if expired and job.status != "expired" and not job.export_path and not job.api_keys_path and not job.log_path:
+            if expired and job.status != "expired" and not job.export_path and not job.export_split_zip_path and not job.api_keys_path and not job.log_path:
                 job.status = "expired"
                 job.log("导出文件已超过 60 分钟，已自动删除")
             if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
@@ -335,6 +335,7 @@ def save_job_history() -> None:
                     "logs": job.logs[-120:],
                     "results": [account_result_to_dict(result) for result in job.results],
                     "export_path": job.export_path,
+                    "export_split_zip_path": job.export_split_zip_path,
                     "api_keys_path": job.api_keys_path,
                     "mfa_secrets_path": job.mfa_secrets_path,
                     "log_path": job.log_path,
@@ -375,6 +376,7 @@ def restore_job_history() -> None:
                     finished_at=finished_at or now,
                     logs=list(item.get("logs") or []),
                     export_path=item.get("export_path") or "",
+                    export_split_zip_path=item.get("export_split_zip_path") or "",
                     api_keys_path=item.get("api_keys_path") or "",
                     mfa_secrets_path=item.get("mfa_secrets_path") or "",
                     log_path=item.get("log_path") or "",
@@ -554,6 +556,7 @@ class Job:
     logs: list[str] = field(default_factory=list)
     results: list[AccountResult] = field(default_factory=list)
     export_path: str = ""
+    export_split_zip_path: str = ""
     api_keys_path: str = ""
     mfa_secrets_path: str = ""
     log_path: str = ""
@@ -733,6 +736,29 @@ def enrich_accounts_with_known_mfa(accounts: list[AccountInput], customer_id: st
             acc.mfa_secret = known[acc.email]
             updated += 1
     return updated
+
+
+def safe_export_filename(value: str, fallback: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._+-]+", "_", (value or "").strip()).strip("._")
+    return (name or fallback)[:80]
+
+
+def build_split_export_zip(export_path: str, zip_path: str) -> int:
+    exported = json.loads(Path(export_path).read_text(encoding="utf-8"))
+    if not isinstance(exported, list):
+        raise ValueError("导出 JSON 格式不是列表")
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for idx, item in enumerate(exported, start=1):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("email") or item.get("account") or item.get("username") or f"account-{idx}")
+        grouped.setdefault(key, []).append(item)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for index, (email, items) in enumerate(grouped.items(), start=1):
+            filename = f"{index:03d}-{safe_export_filename(email, f'account-{index}')}.json"
+            zf.writestr(filename, json.dumps(items, ensure_ascii=False, indent=2))
+    Path(zip_path).chmod(0o600)
+    return len(grouped)
 
 
 def sanitize_proxy(proxy: str) -> str:
@@ -1207,6 +1233,10 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
             out_path.write_text(json.dumps(exported_all, ensure_ascii=False, indent=2), encoding="utf-8")
             out_path.chmod(0o600)
             job.export_path = str(out_path)
+            split_zip_path = out_dir / f"kiro-login-export-split-{job.id}.zip"
+            split_count = build_split_export_zip(str(out_path), str(split_zip_path))
+            job.export_split_zip_path = str(split_zip_path)
+            job.log(f"已生成拆分导出 ZIP：{split_count} 个账号文件")
         else:
             out_path = None
         if api_keys_all:
@@ -1252,6 +1282,7 @@ def job_to_dict(job: Job) -> dict[str, Any]:
             "error": job.error,
             "logs": list(job.logs),
             "downloadReady": bool(job.export_path and Path(job.export_path).exists()),
+            "splitDownloadReady": bool(job.export_split_zip_path and Path(job.export_split_zip_path).exists()),
             "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
             "mfaSecretsDownloadReady": bool(job.mfa_secrets_path and Path(job.mfa_secrets_path).exists() and Path(job.mfa_secrets_path).stat().st_size > 0),
             "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
@@ -1296,6 +1327,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
                 "finishedAt": int(job.finished_at or 0),
                 "expiresIn": None if not job.finished_at else max(0, int(EXPORT_TTL_SECONDS - (time.time() - age_base))),
                 "downloadReady": bool(job.export_path and Path(job.export_path).exists()),
+                "splitDownloadReady": bool(job.export_split_zip_path and Path(job.export_split_zip_path).exists()),
                 "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
                 "mfaSecretsDownloadReady": bool(job.mfa_secrets_path and Path(job.mfa_secrets_path).exists() and Path(job.mfa_secrets_path).stat().st_size > 0),
                 "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
@@ -1305,7 +1337,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
 
 def delete_job_files(job: Job) -> list[str]:
     deleted: list[str] = []
-    for path_attr in ("export_path", "api_keys_path", "mfa_secrets_path", "log_path"):
+    for path_attr in ("export_path", "export_split_zip_path", "api_keys_path", "mfa_secrets_path", "log_path"):
         path_value = getattr(job, path_attr, "")
         if path_value:
             try:
@@ -1583,6 +1615,27 @@ def download_job(job_id: str):
         return jsonify({"error": "导出文件不存在"}), 404
     audit("export.download", jobId=job.id, customerId=customer_id, path=job.export_path, ip=client_ip())
     return send_file(job.export_path, mimetype="application/json", as_attachment=True, download_name=f"kiro-login-export-{job_id}.json")
+
+
+@app.get("/api/jobs/<job_id>/download-split")
+def download_job_split(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    job = JOBS.get(job_id)
+    if not job or job.customer_id != customer_id or not job.export_path or not Path(job.export_path).exists():
+        return jsonify({"error": "导出文件不存在"}), 404
+    split_path = job.export_split_zip_path or str(Path(job.export_path).with_name(f"kiro-login-export-split-{job.id}.zip"))
+    if not Path(split_path).exists():
+        try:
+            build_split_export_zip(job.export_path, split_path)
+            job.export_split_zip_path = split_path
+            save_job_history()
+        except Exception as exc:
+            return jsonify({"error": f"生成拆分 ZIP 失败：{exc}"}), 500
+    audit("export_split.download", jobId=job.id, customerId=customer_id, path=split_path, ip=client_ip())
+    return send_file(split_path, mimetype="application/zip", as_attachment=True, download_name=f"kiro-login-export-split-{job_id}.zip")
 
 
 @app.get("/api/jobs/<job_id>/api-keys/download")
