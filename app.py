@@ -863,12 +863,23 @@ def machine_id_for(email: str, profile_arn: str) -> str:
     return hashlib.sha256(f"{email}|{profile_arn}".encode("utf-8")).hexdigest()
 
 
-def flatten_export(exp: dca.DurableExport, email: str, profile: dict[str, str], priority: int) -> dict[str, Any]:
+def flatten_export(
+    exp: dca.DurableExport,
+    email: str,
+    profile: dict[str, str],
+    priority: int,
+    password: str = "",
+    mfa_secret: str = "",
+) -> dict[str, Any]:
     arn = profile["arn"]
     auth_region = exp.oidc_region or dca.DEFAULT_OIDC_REGION
     api_region = profile.get("region") or dca.region_from_profile_arn(arn) or exp.region
     return {
         "email": email,
+        "username": email,
+        "account": email,
+        "password": password,
+        "mfaSecret": mfa_secret,
         "idp": "Enterprise",
         "profileArn": arn,
         "machineId": machine_id_for(email, arn),
@@ -1160,12 +1171,14 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         )
 
     exported: list[dict[str, Any]] = []
+    export_password = options["new_password"] if outcome.changed_password else acc.password
+    export_mfa_secret = outcome.mfa_secret or acc.mfa_secret
     for profile in profiles:
         check_error = check_profile_available(exp, profile, options.get("strict_probe", False))
         if check_error:
             log(check_error)
             return AccountResult(acc.idx, acc.email, False, check_error, outcome.changed_password)
-        exported.append(flatten_export(exp, acc.email, profile, 0))
+        exported.append(flatten_export(exp, acc.email, profile, 0, export_password, export_mfa_secret))
     api_keys: list[str] = []
     if options.get("create_api_keys") or options.get("api_key_only"):
         api_label = options.get("api_key_label") or "1"
