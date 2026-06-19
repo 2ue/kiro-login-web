@@ -494,6 +494,17 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
         except Exception:
             return False
 
+    def submit_by_enter(input_count: int) -> bool:
+        try:
+            code_inputs().nth(max(0, min(input_count - 1, 1))).press("Enter")
+            return True
+        except Exception:
+            try:
+                page.keyboard.press("Enter")
+                return True
+            except Exception:
+                return False
+
     def still_on_mfa() -> bool:
         try:
             b = _body_text(page).lower()
@@ -577,16 +588,18 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
                 return False, secret
 
         shot(f"mfa_code_filled_{attempt}")
+        enter_submitted = submit_by_enter(n)
+        if enter_submitted:
+            page.wait_for_timeout(1200)
+            if left_mfa_ok():
+                log("    MFA: Enter 提交后已离开绑定页/出现授权页，绑定成功")
+                return True, secret
         clicked = _click_button(page, ["Assign MFA", "Add MFA", "Register", "Confirm",
                                        "Verify", "Submit", "Submit code", "Verify code",
                                        "Continue", "Next", "Done", "Finish",
                                        "绑定", "确认", "提交", "继续", "完成"], log)
-        if not clicked:
-            try:
-                code_inputs().nth(min(n - 1, 1)).press("Enter")
-                log("    MFA: 未找到提交按钮，已按 Enter 兜底")
-            except Exception:
-                pass
+        if not clicked and not enter_submitted:
+            log("    MFA: 未找到提交按钮，且 Enter 提交失败")
         page.wait_for_timeout(2500)
         shot(f"mfa_after_submit_{attempt}")
 
