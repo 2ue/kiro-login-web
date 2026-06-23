@@ -603,6 +603,13 @@ def _looks_like_mfa_secret(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Z2-7]+", v))
 
 
+def mask_mfa_secret(secret: str) -> str:
+    normalized = re.sub(r"[\s-]", "", (secret or "")).upper()
+    if len(normalized) <= 8:
+        return "****"
+    return f"{normalized[:4]}…{normalized[-4:]}"
+
+
 def _parse_aws_access_portal_blocks(text: str) -> list[AccountInput]:
     """解析 AWS access portal 文本块。
 
@@ -1157,7 +1164,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
 
     log("浏览器授权完成，开始换取 token")
     if outcome.mfa_secret:
-        log(f"已绑定新 MFA，密钥：{outcome.mfa_secret}（请妥善保存）")
+        log(f"已绑定新 MFA，密钥：{mask_mfa_secret(outcome.mfa_secret)}（完整密钥请下载 MFA 文件妥善保存）")
 
     exp = dca.poll_for_token(start, fetch_profile=False, log=log, stop_event=job.stop_event)
     if exp.error:
@@ -1457,7 +1464,7 @@ def create_job():
         return jsonify({"error": "同步创建 API Key 和仅创建 API Key 不能同时开启"}), 400
     job_id = secrets.token_hex(8)
     job = Job(id=job_id, customer_id=customer_id, total=len(accounts))
-    threads = max(1, min(int(payload.get("threads") or 3), MAX_THREADS_PER_JOB, len(accounts)))
+    threads = max(1, min(int(payload.get("threads") or 10), MAX_THREADS_PER_JOB, len(accounts)))
     if browser_slots + threads > MAX_BROWSER_SLOTS_GLOBAL:
         return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
     job.threads = threads
@@ -1591,7 +1598,7 @@ def retry_job(job_id: str):
         return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
     # 重新编号 idx（1 起），保留原 email/password/proxy
     accounts = [AccountInput(idx=i + 1, email=a.email, password=a.password, proxy=a.proxy, mfa_secret=a.mfa_secret) for i, a in enumerate(retry_accounts)]
-    threads = max(1, min(int(src.threads or 3), MAX_THREADS_PER_JOB, len(accounts)))
+    threads = max(1, min(int(src.threads or 10), MAX_THREADS_PER_JOB, len(accounts)))
     if browser_slots + threads > MAX_BROWSER_SLOTS_GLOBAL:
         return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
     options["threads"] = threads
