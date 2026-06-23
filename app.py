@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -31,10 +32,31 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import device_code_auth as dca
 import idc_browser_login as idc
 
-app = Flask(__name__)
+
+def _resource_root() -> Path:
+    """Resolve bundled resource root (PyInstaller _MEIPASS) or source dir."""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base)
+    return Path(__file__).parent
+
+
+def _runtime_dir() -> Path:
+    """Writable dir next to the executable (frozen) or source dir."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+_RES_ROOT = _resource_root()
+app = Flask(
+    __name__,
+    template_folder=str(_RES_ROOT / "templates"),
+    static_folder=str(_RES_ROOT / "static"),
+)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config["JSON_AS_ASCII"] = False
-SECRET_PATH = Path(__file__).parent / ".flask-secret"
+SECRET_PATH = _runtime_dir() / ".flask-secret"
 if not SECRET_PATH.exists():
     SECRET_PATH.write_text(secrets.token_urlsafe(48), encoding="utf-8")
     SECRET_PATH.chmod(0o600)
