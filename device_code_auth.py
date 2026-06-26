@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 import ssl
 import time
 import urllib.error
@@ -35,6 +36,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 # --- Config (clone tu 9router) ---
 KIRO_CLIENT_NAME = "kiro-oauth-client"
@@ -109,7 +111,37 @@ def kiro_mgmt_url(region: str) -> str:
 
 
 def _oidc_base(region: str) -> str:
-    return f"https://oidc.{normalize_oidc_region(region)}.amazonaws.com"
+    r = (region or "").strip().lower()
+    # 信任任何合法 region 格式（如 us-east-1 / ap-south-1）；否则走白名单回退
+    if not re.match(r"^[a-z]{2}-[a-z]+-\d+$", r):
+        r = normalize_oidc_region(region)
+    return f"https://oidc.{r}.amazonaws.com"
+
+
+def derive_from_start_url(start_url: str) -> tuple[str, str]:
+    """从 start_url 提取 (region, issuer_url)。
+
+    支持新版 SSO Portal URL：https://ssoins-XXXX.portal.<region>.app.aws[/...]
+      -> region = <region>；issuer_url = https://identitycenter.amazonaws.com/ssoins-XXXX
+    老版 d-xxx.awsapps.com/start 无法从 URL 直接拿到实例 ID，返回空值（由调用方回退默认）。
+    返回 (region, issuer_url)，拿不到的部分为 ""。
+    """
+    url = (start_url or "").strip()
+    if not url:
+        return "", ""
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return "", ""
+    host = host.lower()
+    # 新版：ssoins-XXXX.portal.<region>.app.aws
+    m = re.match(r"^(ssoins-[0-9a-f]+)\.portal\.([a-z0-9-]+)\.app\.aws$", host)
+    if m:
+        instance_id = m.group(1)
+        region = m.group(2)
+        issuer_url = f"https://identitycenter.amazonaws.com/{instance_id}"
+        return region, issuer_url
+    return "", ""
 
 
 def _post_json(url: str, body: dict, headers: Optional[dict] = None,
@@ -213,11 +245,21 @@ def register_and_start(
     """
     if region:
         oidc_region = region
-    oidc_region = normalize_oidc_region(oidc_region)
+    start_url = (start_url or "").strip() or BUILDER_ID_START_URL
+    # 新版 SSO Portal URL：从 URL 自动提取 region 与实例 ID（issuerUrl），
+    # 避免 UI 选错 region 或写死的 issuerUrl 与实际实例不匹配。
+    derived_region, derived_issuer = derive_from_start_url(start_url)
+    issuer_url = derived_issuer or KIRO_ISSUER_URL
+    if derived_region:
+        # 从真实 Portal URL 提取的 region 是权威值，直接用，不走白名单回退
+        oidc_region = derived_region
+    else:
+        oidc_region = normalize_oidc_region(oidc_region)
     kiro_region = normalize_kiro_region(kiro_region)
     log(f"device-code: OIDC={oidc_region} (login IAM) · Kiro Q={kiro_region} (9router quota)")
     auth_method = "idc" if auth_method == "idc" else "builder-id"
-    start_url = (start_url or "").strip() or BUILDER_ID_START_URL
+    if derived_issuer:
+        log(f"device-code: 从 Portal URL 提取实例 issuer={derived_issuer} region={derived_region}")
 
     # 1. RegisterClient
     log("device-code: RegisterClient ...")
@@ -228,7 +270,7 @@ def register_and_start(
             "clientType": KIRO_CLIENT_TYPE,
             "scopes": KIRO_SCOPES,
             "grantTypes": KIRO_GRANT_TYPES,
-            "issuerUrl": KIRO_ISSUER_URL,
+            "issuerUrl": issuer_url,
         },
     )
     client_id = reg.get("clientId")

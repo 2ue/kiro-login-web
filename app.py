@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 import zipfile
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -65,6 +65,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=True,
+    PERMANENT_SESSION_LIFETIME=dt.timedelta(days=30),
 )
 
 
@@ -97,6 +98,23 @@ DEFAULT_NEW_PASSWORD = idc.DEFAULT_NEW_PASSWORD
 PROFILE_SCAN_REGIONS = ("us-east-1", "eu-central-1")
 ACCOUNT_SEP_RE = re.compile(r"[\t,;|]")
 AWS_BLOCK_FIELD_RE = re.compile(r"^\s*([^:]+):\s*(.*)\s*$", re.M)
+# 单行带标签格式：username: xxx password: yyy（password 取到行尾，保留特殊字符）
+INLINE_USER_PASS_RE = re.compile(
+    r"^\s*(?:user(?:name)?|account|email)\s*[:=]\s*(\S+)\s+pass(?:word)?\s*[:=]\s*(.+?)\s*$",
+    re.I,
+)
+# 块格式：login = xxx / onetime password = yyy （账号与密码间用 " / " 分隔；密码可含特殊字符及无空格的 /）
+LOGIN_ONETIME_RE = re.compile(
+    r"^\s*login\s*=\s*(.+?)\s+/\s+(?:one[\s-]*time\s*password|onetime\s*password|otp|password)\s*=\s*(.+?)\s*$",
+    re.I,
+)
+# 块格式中的 2FA 行：2fa验 XXXX / 2fa: XXXX / mfa = XXXX 等
+BLOCK_2FA_RE = re.compile(
+    r"^\s*(?:2fa|mfa|totp)\S*\s*[:=]?\s*([A-Za-z2-7][A-Za-z2-7\s-]+)\s*$",
+    re.I,
+)
+# 简化无标签格式：账号 / 密码（单个 " / " 分隔，账号无空格，密码取到行尾、可含 /）
+SIMPLE_SLASH_RE = re.compile(r"^\s*(\S+)\s+/\s+(.+?)\s*$")
 KIRO_PROFILE_API_VERSION = "0.12.333"
 BLOCKED_PROXY_HOSTS = ("127.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "192.168.", "localhost", "0.0.0.0", "::1")
 
@@ -275,10 +293,16 @@ def validate_start_url(value: str) -> tuple[bool, str]:
     if parsed.scheme != "https":
         return False, "IDC Start URL 必须是 https:// 开头"
     host = (parsed.hostname or "").lower()
-    if not host.endswith(".awsapps.com"):
-        return False, "IDC Start URL 域名应为 *.awsapps.com"
-    if not parsed.path.rstrip("/").endswith("/start"):
-        return False, "IDC Start URL 通常应以 /start 结尾"
+    # 支持两种格式：
+    # 1. 老 IDC Start URL: *.awsapps.com/start
+    # 2. 新 SSO Portal URL: *.portal.*.app.aws (路径可选 /start 或 /)
+    is_awsapps = host.endswith(".awsapps.com")
+    is_portal = ".portal." in host and host.endswith(".app.aws")
+    if not (is_awsapps or is_portal):
+        return False, "IDC Start URL 域名应为 *.awsapps.com 或 *.portal.<region>.app.aws"
+    path = parsed.path.rstrip("/")
+    if is_awsapps and path and not path.endswith("/start"):
+        return False, "*.awsapps.com 域名通常应以 /start 结尾"
     return True, url
 
 
@@ -337,6 +361,26 @@ def account_result_to_dict(result: "AccountResult") -> dict[str, Any]:
     }
 
 
+def account_input_to_dict(account: "AccountInput") -> dict[str, str | int]:
+    return {
+        "idx": account.idx,
+        "email": account.email,
+        "password": account.password,
+        "proxy": account.proxy,
+        "mfaSecret": account.mfa_secret,
+    }
+
+
+def account_input_from_dict(item: dict[str, Any], fallback_idx: int) -> "AccountInput":
+    return AccountInput(
+        idx=int(item.get("idx") or fallback_idx),
+        email=str(item.get("email") or ""),
+        password=str(item.get("password") or ""),
+        proxy=str(item.get("proxy") or ""),
+        mfa_secret=str(item.get("mfaSecret") or item.get("mfa_secret") or ""),
+    )
+
+
 def save_job_history() -> None:
     try:
         HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -363,14 +407,26 @@ def save_job_history() -> None:
                     "log_path": job.log_path,
                     "total": job.total,
                     "threads": job.threads,
+                    "kind": job.kind,
+                    "usesBrowser": job.uses_browser,
                     "done": job.done,
                     "ok": job.ok,
                     "failed": job.failed,
                     "error": job.error,
+                    "accounts": [account_input_to_dict(account) for account in job.accounts],
+                    "options": job.options,
                 })
         tmp = HISTORY_PATH.with_name(f"{HISTORY_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except Exception:
+            pass
         tmp.replace(HISTORY_PATH)
+        try:
+            HISTORY_PATH.chmod(0o600)
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning("save job history failed: %s", exc)
 
@@ -404,6 +460,8 @@ def restore_job_history() -> None:
                     log_path=item.get("log_path") or "",
                     total=int(item.get("total") or 0),
                     threads=int(item.get("threads") or 1),
+                    kind=item.get("kind") or "login",
+                    uses_browser=bool(item.get("usesBrowser", True)),
                     done=int(item.get("done") or 0),
                     ok=int(item.get("ok") or 0),
                     failed=int(item.get("failed") or 0),
@@ -418,6 +476,12 @@ def restore_job_history() -> None:
                         bool(result.get("changedPassword")),
                         mfa_secret=result.get("mfaSecret") or "",
                     ))
+                job.accounts = [
+                    account_input_from_dict(account, idx + 1)
+                    for idx, account in enumerate(item.get("accounts") or [])
+                    if isinstance(account, dict) and (account.get("email") or account.get("account"))
+                ]
+                job.options = dict(item.get("options") or {})
                 JOBS[job.id] = job
     except Exception as exc:
         logger.warning("restore job history failed: %s", exc)
@@ -584,6 +648,8 @@ class Job:
     log_path: str = ""
     total: int = 0
     threads: int = 1
+    kind: str = "login"
+    uses_browser: bool = True
     done: int = 0
     ok: int = 0
     failed: int = 0
@@ -691,16 +757,108 @@ def extract_start_url_from_accounts_text(text: str) -> str:
     return default_url or dual_stack_url
 
 
-def parse_accounts(text: str) -> list[AccountInput]:
+def _parse_login_onetime_blocks(text: str) -> list[AccountInput]:
+    """解析 mmostore 常见的块格式：
+      login = neueorgjuni2147 / onetime password = uKV0y)_...
+      2fa验 FIB3J655XDKKQZQBQJ466X65BNWJGLBR
+
+    每个账号可占 1~2 行：一行 login=.../onetime password=...，可选紧跟一行 2fa 密钥。
+    账号间用空行或下一个 login= 行区分。账号字段仍沿用 AccountInput.email。
+    """
+    accounts: list[AccountInput] = []
+    pending: AccountInput | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = LOGIN_ONETIME_RE.match(line)
+        if m:
+            email = m.group(1).strip()
+            password = m.group(2).strip()
+            if email and password:
+                pending = AccountInput(idx=len(accounts) + 1, email=email, password=password)
+                accounts.append(pending)
+            continue
+        # 无标签 "账号 / 密码" 行（不带 login=/onetime 标签时的简化写法）
+        ms = SIMPLE_SLASH_RE.match(line)
+        if ms and not BLOCK_2FA_RE.match(line):
+            email = ms.group(1).strip()
+            password = ms.group(2).strip()
+            if email and password and email.lower() != "login":
+                pending = AccountInput(idx=len(accounts) + 1, email=email, password=password)
+                accounts.append(pending)
+            continue
+        m2 = BLOCK_2FA_RE.match(line)
+        if m2 and pending is not None and not pending.mfa_secret:
+            candidate = m2.group(1).strip()
+            if _looks_like_mfa_secret(candidate):
+                pending.mfa_secret = re.sub(r"[\s-]", "", candidate).upper()
+            continue
+        # 裸密钥行（聊天气泡里 2fa 标签与密钥被换行拆开的情况）：整行就是 base32 密钥
+        if pending is not None and not pending.mfa_secret and _looks_like_mfa_secret(line):
+            pending.mfa_secret = re.sub(r"[\s-]", "", line).upper()
+            continue
+    return accounts
+
+
+def _parse_fixed_columns(text: str) -> list[AccountInput]:
+    """固定列格式：每行 `账号 密码 2fa(可空)`，以空白符（空格/tab）分隔。
+
+    这种模式下密码不能含空格；第三列始终当 2fa 密钥（可留空）。
+    """
+    accounts: list[AccountInput] = []
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p for p in re.split(r"\s+", line) if p]
+        if len(parts) < 2:
+            continue
+        email = parts[0]
+        password = parts[1]
+        mfa_secret = ""
+        if len(parts) >= 3:
+            cand = parts[2]
+            if _looks_like_mfa_secret(cand):
+                mfa_secret = re.sub(r"[\s-]", "", cand).upper()
+        if email.lower() in {"email", "username", "user", "account", "账号"}:
+            continue
+        accounts.append(AccountInput(idx=idx, email=email, password=password, mfa_secret=mfa_secret))
+    return accounts
+
+
+def parse_accounts(text: str, mode: str = "auto") -> list[AccountInput]:
     """解析账号输入。支持格式（分隔符可用空格/tab/逗号/分号/竖线/冒号）：
       email password                       # 最简
       email password proxy                 # 带代理
       email password mfa_secret            # 已绑定 MFA（自动识别 base32 密钥）
       email password proxy mfa_secret      # 代理 + MFA
       AWS access portal 文本块              # Username + One-time password
+      login = xxx / onetime password = yyy + 2fa验 XXXX  # mmostore 块格式
     第 3 段会自动判断是代理还是 MFA 密钥：看起来像 base32 密钥就当 MFA，
     否则当代理。无需 mfa= 前缀。mfa_secret 是 authenticator app 导出的 base32（A-Z 2-7）。
+    mode="fixed" 时强制按「账号 密码 2fa(可空)」空白分隔解析。
     """
+    if mode == "fixed":
+        return _parse_fixed_columns(text)
+
+    # 优先：mmostore login=/onetime password= 块格式
+    login_blocks = _parse_login_onetime_blocks(text)
+    if login_blocks:
+        return login_blocks
+
+    # 其次：单行带标签格式 username: xxx password: yyy
+    inline_accounts: list[AccountInput] = []
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        m = INLINE_USER_PASS_RE.match(raw.strip())
+        if m:
+            email = m.group(1).strip()
+            password = m.group(2).strip()
+            if email and password:
+                inline_accounts.append(AccountInput(idx=idx, email=email, password=password))
+    if inline_accounts:
+        return inline_accounts
+
     aws_accounts = _parse_aws_access_portal_blocks(text)
     if aws_accounts:
         return aws_accounts
@@ -778,22 +936,78 @@ def random_account_password() -> str:
     return f"Kiro@{core}#"
 
 
-def build_split_export_zip(export_path: str, zip_path: str) -> int:
+def stronger_account_password() -> str:
+    """Generate a conservative AWS IDC-compatible password for policy retry."""
+    lower = "abcdefghijkmnopqrstuvwxyz"
+    upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    digits = "23456789"
+    symbols = "!@#$%^&*()-_=+"
+    pool = lower + upper + digits + symbols
+    chars = [
+        secrets.choice(lower),
+        secrets.choice(upper),
+        secrets.choice(digits),
+        secrets.choice(symbols),
+    ]
+    chars.extend(secrets.choice(pool) for _ in range(24))
+    secrets.SystemRandom().shuffle(chars)
+    return "Kiro" + "".join(chars)
+
+
+def clamp_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(low, min(parsed, high))
+
+
+def looks_like_password_policy_error(message: str) -> bool:
+    msg = (message or "").lower()
+    markers = (
+        "首次登录改密码失败",
+        "invalid password",
+        "password policy",
+        "密码策略",
+        "密码不符合",
+        "new password",
+        "set password",
+        "change password",
+    )
+    return any(marker.lower() in msg for marker in markers)
+
+
+def build_split_export_zip(export_path: str, zip_path: str, accounts_per_file: int = 1) -> int:
     exported = json.loads(Path(export_path).read_text(encoding="utf-8"))
     if not isinstance(exported, list):
         raise ValueError("导出 JSON 格式不是列表")
+    accounts_per_file = max(1, min(int(accounts_per_file or 1), 1000))
     grouped: dict[str, list[dict[str, Any]]] = {}
     for idx, item in enumerate(exported, start=1):
         if not isinstance(item, dict):
             continue
         key = str(item.get("email") or item.get("account") or item.get("username") or f"account-{idx}")
         grouped.setdefault(key, []).append(item)
+    groups = list(grouped.items())
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for index, (email, items) in enumerate(grouped.items(), start=1):
-            filename = f"{index:03d}-{safe_export_filename(email, f'account-{index}')}.json"
-            zf.writestr(filename, json.dumps(items, ensure_ascii=False, indent=2))
+        for index in range(0, len(groups), accounts_per_file):
+            chunk = groups[index:index + accounts_per_file]
+            if not chunk:
+                continue
+            file_no = index // accounts_per_file + 1
+            if accounts_per_file == 1:
+                email, items = chunk[0]
+                filename = f"{file_no:03d}-{safe_export_filename(email, f'account-{file_no}')}.json"
+                payload = items
+            else:
+                start_no = index + 1
+                end_no = index + len(chunk)
+                first_email = chunk[0][0]
+                filename = f"{file_no:03d}-accounts-{start_no:03d}-{end_no:03d}-{safe_export_filename(first_email, f'account-{start_no}')}.json"
+                payload = [item for _email, items in chunk for item in items]
+            zf.writestr(filename, json.dumps(payload, ensure_ascii=False, indent=2))
     Path(zip_path).chmod(0o600)
-    return len(grouped)
+    return (len(groups) + accounts_per_file - 1) // accounts_per_file if groups else 0
 
 
 def sanitize_proxy(proxy: str) -> str:
@@ -1164,22 +1378,48 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     log("已获取登录 URL，开始浏览器登录")
     new_password = random_account_password() if options.get("password_mode") == "random" else options["new_password"]
 
-    outcome = idc.drive_login(
-        start.verification_uri_complete,
-        acc.email,
-        acc.password,
-        new_password,
-        log=log,
-        headless=options["headless"],
-        proxy=acc.proxy,
-        timeout_s=options["login_timeout"],
-        window_index=acc.idx - 1,
-        window_count=options["threads"],
-        debug_dir=str(debug_dir),
-        stop_event=job.stop_event,
-        mfa_secret=acc.mfa_secret,
-        on_secret=_save_mfa_early,
-    )
+    def _drive_once(login_url: str, candidate_new_password: str) -> idc.LoginOutcome:
+        return idc.drive_login(
+            login_url,
+            acc.email,
+            acc.password,
+            candidate_new_password,
+            log=log,
+            headless=options["headless"],
+            proxy=acc.proxy,
+            timeout_s=options["login_timeout"],
+            window_index=acc.idx - 1,
+            window_count=options["threads"],
+            debug_dir=str(debug_dir),
+            stop_event=job.stop_event,
+            mfa_secret=acc.mfa_secret,
+            on_secret=_save_mfa_early,
+        )
+
+    outcome = _drive_once(start.verification_uri_complete, new_password)
+    if (not outcome.ok
+            and outcome.changed_password
+            and looks_like_password_policy_error(outcome.error)
+            and not (job.stop_event and job.stop_event.is_set())):
+        retry_password = stronger_account_password()
+        log("首次改密密码策略不通过，自动生成更强新密码并重试一次")
+        start_retry = dca.register_and_start(
+            oidc_region=options["oidc_region"],
+            kiro_region=options["kiro_region"],
+            start_url=options["start_url"],
+            log=log,
+        )
+        if not start_retry.ok:
+            log(f"重新获取登录 URL 失败：{start_retry.error}")
+            return AccountResult(acc.idx, acc.email, False, start_retry.error, outcome.changed_password)
+        retry_outcome = _drive_once(start_retry.verification_uri_complete, retry_password)
+        if retry_outcome.ok:
+            log("自动重试改密成功")
+            start = start_retry
+            new_password = retry_password
+            outcome = retry_outcome
+        else:
+            outcome = retry_outcome
     if not outcome.ok:
         log(f"浏览器登录失败：{outcome.error}")
         return AccountResult(acc.idx, acc.email, False, outcome.error, outcome.changed_password)
@@ -1256,25 +1496,44 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
     api_keys_all: list[str] = []
     try:
         with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = {executor.submit(run_one, job, acc, options): acc for acc in accounts}
-            for future in as_completed(futures):
-                acc = futures[future]
+            pending_accounts = iter(accounts)
+            futures: dict[Any, AccountInput] = {}
+
+            def submit_next() -> bool:
+                if job.stop_event.is_set():
+                    return False
                 try:
-                    result = future.result()
-                except Exception as exc:
-                    result = AccountResult(acc.idx, acc.email, False, f"任务异常：{exc}")
-                with JOBS_LOCK:
-                    job.results.append(result)
-                    job.results.sort(key=lambda item: item.idx)
-                    job.done += 1
-                    if result.ok:
-                        job.ok += 1
-                        exported_all.extend(result.exported)
-                        api_keys_all.extend(result.api_keys)
-                    else:
-                        job.failed += 1
-                    save_job_history()
-                job.log(f"{acc.email}: {result.message}（进度 {job.done}/{job.total}）")
+                    next_acc = next(pending_accounts)
+                except StopIteration:
+                    return False
+                futures[executor.submit(run_one, job, next_acc, options)] = next_acc
+                return True
+
+            for _ in range(threads):
+                if not submit_next():
+                    break
+
+            while futures:
+                done_set, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done_set:
+                    acc = futures.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = AccountResult(acc.idx, acc.email, False, f"任务异常：{exc}")
+                    with JOBS_LOCK:
+                        job.results.append(result)
+                        job.results.sort(key=lambda item: item.idx)
+                        job.done += 1
+                        if result.ok:
+                            job.ok += 1
+                            exported_all.extend(result.exported)
+                            api_keys_all.extend(result.api_keys)
+                        else:
+                            job.failed += 1
+                        save_job_history()
+                    job.log(f"{acc.email}: {result.message}（进度 {job.done}/{job.total}）")
+                    submit_next()
         if not options.get("api_key_only"):
             for priority, item in enumerate(exported_all):
                 item["priority"] = priority
@@ -1284,9 +1543,11 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
             out_path.chmod(0o600)
             job.export_path = str(out_path)
             split_zip_path = out_dir / f"kiro-login-export-split-{job.id}.zip"
-            split_count = build_split_export_zip(str(out_path), str(split_zip_path))
+            split_accounts_per_file = clamp_int(options.get("split_accounts_per_file"), 1, 1, 1000)
+            split_count = build_split_export_zip(str(out_path), str(split_zip_path), split_accounts_per_file)
             job.export_split_zip_path = str(split_zip_path)
-            job.log(f"已生成拆分导出 ZIP：{split_count} 个账号文件")
+            unit = "账号文件" if split_accounts_per_file == 1 else f"文件（每份最多 {split_accounts_per_file} 个账号）"
+            job.log(f"已生成拆分导出 ZIP：{split_count} 个{unit}")
         else:
             out_path = None
         if api_keys_all:
@@ -1338,7 +1599,11 @@ def job_to_dict(job: Job) -> dict[str, Any]:
             "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
             "createdAt": int(job.created_at),
             "finishedAt": int(job.finished_at or 0),
-            "retryableCount": (len([a for a in job.accounts if a.email not in {r.email for r in job.results if r.ok}]) if (job.status in {"finished", "failed", "stopped"} and job.accounts) else 0),
+            "retryableCount": (
+                len([a for a in job.accounts if (a.idx, a.email) not in {(r.idx, r.email) for r in job.results if r.ok}])
+                if (job.status in {"finished", "failed", "stopped"} and job.accounts)
+                else 0
+            ),
             "results": [
                 {
                     "idx": r.idx,
@@ -1366,6 +1631,10 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
         )
         for job in jobs[:20]:
             age_base = job.finished_at or time.time()
+            retryable_count = 0
+            if job.status in {"finished", "failed", "stopped"} and job.accounts:
+                done_keys = {(r.idx, r.email) for r in job.results if r.ok}
+                retryable_count = len([a for a in job.accounts if (a.idx, a.email) not in done_keys])
             rows.append({
                 "id": job.id,
                 "status": job.status,
@@ -1381,6 +1650,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
                 "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
                 "mfaSecretsDownloadReady": bool(job.mfa_secrets_path and Path(job.mfa_secrets_path).exists() and Path(job.mfa_secrets_path).stat().st_size > 0),
                 "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
+                "retryableCount": retryable_count,
             })
     return rows
 
@@ -1403,8 +1673,22 @@ def active_job_counts(customer_id: str) -> tuple[int, int, int]:
     with JOBS_LOCK:
         active = [job for job in JOBS.values() if job.status in {"queued", "running"}]
         customer_active = sum(1 for job in active if job.customer_id == customer_id)
-        browser_slots = sum(max(1, job.threads) for job in active)
+        browser_slots = sum(max(1, job.threads) for job in active if job.uses_browser)
         return customer_active, len(active), browser_slots
+
+
+def can_enqueue_locked(customer_id: str, requested_threads: int, uses_browser: bool) -> tuple[bool, str]:
+    active = [job for job in JOBS.values() if job.status in {"queued", "running"}]
+    customer_active = sum(1 for job in active if job.customer_id == customer_id)
+    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
+        return False, f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"
+    if len(active) >= MAX_ACTIVE_JOBS_GLOBAL:
+        return False, "当前服务器任务繁忙，请稍后再试"
+    if uses_browser:
+        browser_slots = sum(max(1, job.threads) for job in active if job.uses_browser)
+        if browser_slots + requested_threads > MAX_BROWSER_SLOTS_GLOBAL:
+            return False, f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"
+    return True, ""
 
 
 @app.get("/login")
@@ -1433,6 +1717,7 @@ def login_submit():
         audit("customer.renamed", customerId=customer["id"], customerName=customer["name"], ip=client_ip())
     session["customer_id"] = customer["id"]
     session["customer_name"] = customer["name"]
+    session.permanent = True
     audit("auth.login", customerId=customer["id"], customerName=customer["name"], created=created, ip=client_ip())
     return redirect(url_for("index"))
 
@@ -1464,17 +1749,12 @@ def create_job():
     if not customer_id:
         return jsonify({"error": "请先输入客户密码"}), 401
     payload = request.get_json(force=True)
-    accounts = parse_accounts(payload.get("accounts", ""))
+    accounts = parse_accounts(payload.get("accounts", ""), mode=(payload.get("accountMode") or "auto"))
     if not accounts:
         return jsonify({"error": "没有解析到账号，请按 email:password 每行一个填写"}), 400
     enriched_mfa = enrich_accounts_with_known_mfa(accounts, customer_id)
     if len(accounts) > MAX_ACCOUNTS_PER_JOB:
         return jsonify({"error": f"单次最多提交 {MAX_ACCOUNTS_PER_JOB} 个账号"}), 400
-    customer_active, global_active, browser_slots = active_job_counts(customer_id)
-    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
-        return jsonify({"error": f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"}), 429
-    if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
-        return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
     raw_accounts_text = payload.get("accounts", "")
     raw_start_url = (payload.get("startUrl") or "").strip() or extract_start_url_from_accounts_text(raw_accounts_text)
     ok_start_url, start_url_or_error = validate_start_url(raw_start_url)
@@ -1485,13 +1765,10 @@ def create_job():
     if create_api_keys and api_key_only:
         return jsonify({"error": "同步创建 API Key 和仅创建 API Key 不能同时开启"}), 400
     job_id = secrets.token_hex(8)
-    job = Job(id=job_id, customer_id=customer_id, total=len(accounts))
-    threads = max(1, min(int(payload.get("threads") or 10), MAX_THREADS_PER_JOB, len(accounts)))
-    if browser_slots + threads > MAX_BROWSER_SLOTS_GLOBAL:
-        return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
-    job.threads = threads
-    login_timeout = max(60, min(int(payload.get("loginTimeout") or 180), 600))
-    password_mode = "random" if payload.get("passwordMode") == "random" else "fixed"
+    threads = max(1, min(clamp_int(payload.get("threads"), 10, 1, MAX_THREADS_PER_JOB), len(accounts)))
+    job = Job(id=job_id, customer_id=customer_id, total=len(accounts), threads=threads, kind="login", uses_browser=True)
+    login_timeout = clamp_int(payload.get("loginTimeout"), 180, 60, 600)
+    password_mode = "fixed" if payload.get("passwordMode") == "fixed" else "random"
     options = {
         "start_url": start_url_or_error,
         "oidc_region": dca.normalize_oidc_region(payload.get("oidcRegion") or dca.DEFAULT_OIDC_REGION),
@@ -1505,8 +1782,12 @@ def create_job():
         "api_key_only": api_key_only,
         "api_key_label": (payload.get("apiKeyLabel") or "1").strip()[:80] or "1",
         "strict_probe": bool(payload.get("strictProbe", False)),
+        "split_accounts_per_file": clamp_int(payload.get("splitAccountsPerFile"), 1, 1, 1000),
     }
     with JOBS_LOCK:
+        ok_enqueue, enqueue_error = can_enqueue_locked(customer_id, threads, True)
+        if not ok_enqueue:
+            return jsonify({"error": enqueue_error}), 429
         job.accounts = accounts
         job.options = options
         JOBS[job_id] = job
@@ -1533,16 +1814,14 @@ def create_json_api_key_job():
         return jsonify({"error": "ZIP 文件格式不正确"}), 400
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
-    customer_active, global_active, _browser_slots = active_job_counts(customer_id)
-    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
-        return jsonify({"error": f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"}), 429
-    if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
-        return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
-    threads = max(1, min(int(request.form.get("threads") or 5), MAX_THREADS_PER_JOB, len(rows)))
+    threads = max(1, min(clamp_int(request.form.get("threads"), 5, 1, MAX_THREADS_PER_JOB), len(rows)))
     label = (request.form.get("apiKeyLabel") or "1").strip()[:80] or "1"
     job_id = secrets.token_hex(8)
-    job = Job(id=job_id, customer_id=customer_id, total=len(rows), threads=threads)
+    job = Job(id=job_id, customer_id=customer_id, total=len(rows), threads=threads, kind="json_api_key", uses_browser=False)
     with JOBS_LOCK:
+        ok_enqueue, enqueue_error = can_enqueue_locked(customer_id, threads, False)
+        if not ok_enqueue:
+            return jsonify({"error": enqueue_error}), 429
         JOBS[job_id] = job
     save_job_history()
     audit("json_apikey_job.created", jobId=job_id, customerId=customer_id, total=len(rows), threads=threads, ip=client_ip())
@@ -1603,31 +1882,25 @@ def retry_job(job_id: str):
             return jsonify({"error": "任务运行中，请先中断或等其结束再重试"}), 409
         if not src.accounts:
             return jsonify({"error": "该任务的账号数据已不在内存（可能服务重启过），请重新提交这几个号"}), 409
-        # 收集失败/未成功的 email（去重）
-        failed_emails = {r.email for r in src.results if not r.ok}
-        # 结果里根本没出现过的账号（被跳过）也算未成功
-        done_emails = {r.email for r in src.results if r.ok}
-        retry_accounts = [a for a in src.accounts if a.email not in done_emails]
+        # 结果里根本没出现过的账号（被中断/跳过）也算未成功。
+        # 用 (idx,email) 匹配，避免同一用户名/邮箱重复提交时误判全部成功。
+        done_keys = {(r.idx, r.email) for r in src.results if r.ok}
+        retry_accounts = [a for a in src.accounts if (a.idx, a.email) not in done_keys]
         if not retry_accounts:
             return jsonify({"error": "没有需要重试的账号（全部已成功）"}), 400
         options = dict(src.options or {})
         if not options:
             return jsonify({"error": "该任务配置已不在内存，请重新提交"}), 409
-    customer_active, global_active, browser_slots = active_job_counts(customer_id)
-    if customer_active >= MAX_ACTIVE_JOBS_PER_CUSTOMER:
-        return jsonify({"error": f"当前客户最多同时运行 {MAX_ACTIVE_JOBS_PER_CUSTOMER} 个任务"}), 429
-    if global_active >= MAX_ACTIVE_JOBS_GLOBAL:
-        return jsonify({"error": "当前服务器任务繁忙，请稍后再试"}), 429
     # 重新编号 idx（1 起），保留原 email/password/proxy
     accounts = [AccountInput(idx=i + 1, email=a.email, password=a.password, proxy=a.proxy, mfa_secret=a.mfa_secret) for i, a in enumerate(retry_accounts)]
-    threads = max(1, min(int(src.threads or 10), MAX_THREADS_PER_JOB, len(accounts)))
-    if browser_slots + threads > MAX_BROWSER_SLOTS_GLOBAL:
-        return jsonify({"error": f"当前服务器浏览器并发已满，请稍后再试（全局上限 {MAX_BROWSER_SLOTS_GLOBAL}）"}), 429
+    threads = max(1, min(int(src.threads or 6), MAX_THREADS_PER_JOB, len(accounts)))
     options["threads"] = threads
     new_id = secrets.token_hex(8)
-    job = Job(id=new_id, customer_id=customer_id, total=len(accounts))
-    job.threads = threads
+    job = Job(id=new_id, customer_id=customer_id, total=len(accounts), threads=threads, kind="login", uses_browser=True)
     with JOBS_LOCK:
+        ok_enqueue, enqueue_error = can_enqueue_locked(customer_id, threads, True)
+        if not ok_enqueue:
+            return jsonify({"error": enqueue_error}), 429
         job.accounts = accounts
         job.options = options
         JOBS[new_id] = job
@@ -1681,7 +1954,7 @@ def download_job_split(job_id: str):
     split_path = job.export_split_zip_path or str(Path(job.export_path).with_name(f"kiro-login-export-split-{job.id}.zip"))
     if not Path(split_path).exists():
         try:
-            build_split_export_zip(job.export_path, split_path)
+            build_split_export_zip(job.export_path, split_path, clamp_int(job.options.get("split_accounts_per_file"), 1, 1, 1000))
             job.export_split_zip_path = split_path
             save_job_history()
         except Exception as exc:
