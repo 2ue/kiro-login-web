@@ -97,10 +97,10 @@ DEFAULT_START_URL = idc.DEFAULT_IDC_START_URL
 DEFAULT_NEW_PASSWORD = idc.DEFAULT_NEW_PASSWORD
 PROFILE_SCAN_REGIONS = ("us-east-1", "eu-central-1")
 ACCOUNT_SEP_RE = re.compile(r"[\t,;|]")
-AWS_BLOCK_FIELD_RE = re.compile(r"^\s*([^:]+):\s*(.*)\s*$", re.M)
+AWS_BLOCK_FIELD_RE = re.compile(r"^\s*([^:：]+)[:：]\s*(.*)\s*$", re.M)
 # 单行带标签格式：username: xxx password: yyy（password 取到行尾，保留特殊字符）
 INLINE_USER_PASS_RE = re.compile(
-    r"^\s*(?:user(?:name)?|account|email)\s*[:=]\s*(\S+)\s+pass(?:word)?\s*[:=]\s*(.+?)\s*$",
+    r"^\s*(?:user(?:name)?|account|email)\s*[:：=]\s*(\S+)\s+pass(?:word)?\s*[:：=]\s*(.+?)\s*$",
     re.I,
 )
 # 块格式：login = xxx / onetime password = yyy （账号与密码间用 " / " 分隔；密码可含特殊字符及无空格的 /）
@@ -1951,16 +1951,23 @@ def download_job_split(job_id: str):
     job = JOBS.get(job_id)
     if not job or job.customer_id != customer_id or not job.export_path or not Path(job.export_path).exists():
         return jsonify({"error": "导出文件不存在"}), 404
-    split_path = job.export_split_zip_path or str(Path(job.export_path).with_name(f"kiro-login-export-split-{job.id}.zip"))
+    requested_per_file = request.args.get("perFile") or request.args.get("accountsPerFile") or request.args.get("n")
+    accounts_per_file = clamp_int(requested_per_file, clamp_int(job.options.get("split_accounts_per_file"), 1, 1, 1000), 1, 1000)
+    default_per_file = clamp_int(job.options.get("split_accounts_per_file"), 1, 1, 1000)
+    if accounts_per_file == default_per_file:
+        split_path = job.export_split_zip_path or str(Path(job.export_path).with_name(f"kiro-login-export-split-{job.id}-per-{accounts_per_file}.zip"))
+    else:
+        split_path = str(Path(job.export_path).with_name(f"kiro-login-export-split-{job.id}-per-{accounts_per_file}.zip"))
     if not Path(split_path).exists():
         try:
-            build_split_export_zip(job.export_path, split_path, clamp_int(job.options.get("split_accounts_per_file"), 1, 1, 1000))
-            job.export_split_zip_path = split_path
-            save_job_history()
+            build_split_export_zip(job.export_path, split_path, accounts_per_file)
+            if accounts_per_file == default_per_file:
+                job.export_split_zip_path = split_path
+                save_job_history()
         except Exception as exc:
             return jsonify({"error": f"生成拆分 ZIP 失败：{exc}"}), 500
-    audit("export_split.download", jobId=job.id, customerId=customer_id, path=split_path, ip=client_ip())
-    return send_file(split_path, mimetype="application/zip", as_attachment=True, download_name=f"kiro-login-export-split-{job_id}.zip")
+    audit("export_split.download", jobId=job.id, customerId=customer_id, path=split_path, accountsPerFile=accounts_per_file, ip=client_ip())
+    return send_file(split_path, mimetype="application/zip", as_attachment=True, download_name=f"kiro-login-export-split-{job_id}-per-{accounts_per_file}.zip")
 
 
 @app.get("/api/jobs/<job_id>/api-keys/download")
