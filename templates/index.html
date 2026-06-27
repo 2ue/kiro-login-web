@@ -49,8 +49,6 @@
     .parse-preview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:9px}.preview-chip{border:1px solid rgba(148,163,184,.16);border-radius:13px;background:rgba(2,6,23,.38);padding:8px 9px}.preview-chip strong{display:block;font-size:15px;color:#e0f2fe}.preview-chip span{display:block;margin-top:2px;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.preview-chip.ok strong{color:var(--ok)}.preview-chip.warn strong{color:var(--warn)}.preview-chip.fail strong{color:#fda4af}
     .result-panel{display:none;margin:10px 0 0;border:1px solid var(--line);border-radius:16px;overflow:hidden;background:rgba(2,6,23,.24)}.result-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border-bottom:1px solid var(--line)}.result-title{font-size:12px;font-weight:950;color:#dbeafe}.result-tools{display:flex;gap:6px;flex-wrap:wrap}.result-tools button{min-height:28px;padding:5px 9px;border-radius:999px;font-size:11px}.result-tools button.active{background:rgba(96,165,250,.22);border:1px solid rgba(96,165,250,.32)}.result-table-wrap{max-height:220px;overflow:auto}.result-table{width:100%;margin:0;border:0;border-radius:0;font-size:11px}.result-table th{position:sticky;top:0;z-index:1}.result-table td,.result-table th{padding:7px 8px}.result-email{font-family:ui-monospace,monospace;color:#dbeafe;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.result-msg{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mini-btn{min-height:26px!important;padding:4px 8px!important;border-radius:9px!important;font-size:10px!important}.row-status{display:inline-flex;align-items:center;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:900}.row-status.ok{background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.30);color:var(--ok)}.row-status.fail{background:rgba(251,113,133,.10);border:1px solid rgba(251,113,133,.30);color:#fda4af}
 
-
-    .checkgrid{grid-template-columns:repeat(2,minmax(0,1fr))}.step-card{padding:10px}.card-desc,.hint{max-width:620px}.log-details:not([open]){background:rgba(2,6,23,.12)}
     .modal-backdrop{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(2,6,23,.72);backdrop-filter:blur(12px)}.modal-backdrop.show{display:flex}.modal-card{width:min(420px,100%);border:1px solid rgba(148,163,184,.24);border-radius:22px;background:linear-gradient(180deg,rgba(15,23,42,.98),rgba(2,6,23,.96));box-shadow:0 30px 90px rgba(0,0,0,.50);padding:18px}.modal-title{margin:0;color:#e0f2fe;font-size:17px;font-weight:950;letter-spacing:-.02em}.modal-desc{margin:6px 0 14px;color:var(--muted);font-size:12px;line-height:1.45}.modal-actions{display:flex;gap:9px;justify-content:flex-end;margin-top:14px}.modal-actions button{min-height:38px}.modal-error{display:none;margin-top:8px;color:#fda4af;font-size:12px;font-weight:800}.quick-splits{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.quick-splits button{min-height:30px;padding:6px 10px;border-radius:999px;font-size:11px;background:rgba(30,41,59,.92)}
     @media(min-width:981px){.upload-compact{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr) auto;gap:8px;align-items:end}}
     @media(min-width:1500px){textarea{min-height:190px}.logbox{min-height:220px;max-height:320px}.card-head{padding-left:20px;padding-right:20px}.card-body{padding-left:20px;padding-right:20px}}
@@ -63,7 +61,7 @@
     <div>
       <span class="eyebrow">Kiro Login Tool · 高速批量登录</span>
       <h1>Kiro 登录工具</h1>
-      <p class="subtitle">粘贴账号，确认配置，开始登录。结果文件保留 60 分钟。</p>
+      <p class="subtitle">粘贴账号、填写 IDC Start URL，一键登录、检查可用性并导出 JSON 或 API Key。前台只显示关键状态，完整日志/文件保留 60 分钟。</p>
     </div>
     <form class="session" method="post" action="/logout">
       <span class="pill">{{ customer_name }}</span>
@@ -74,13 +72,13 @@
   <div class="shell">
     <section class="card">
       <div class="card-head">
-        <div><h2 class="card-title">账号导入</h2><p class="card-desc">粘贴账号，确认常用配置。</p></div>
+        <div><h2 class="card-title">账号导入</h2><p class="card-desc">先粘贴账号和 Start URL，再在下方确认运行配置。</p></div>
         <span class="pill">保留 {{ export_ttl_seconds // 60 }} 分钟</span>
       </div>
       <div class="card-body stack">
         <div class="form-section step-card">
-          <div class="step-title"><span class="step-no">1</span><span>账号导入</span><span class="step-sub">粘贴后自动识别</span></div>
-          <div style="margin-bottom:8px"><label>账号格式</label><select id="accountMode"><option value="auto" selected>自动识别（兼容 login=/onetime password=、AWS 文本块、email:password 等）</option><option value="fixed">固定格式：账号 密码 2FA</option></select></div>
+          <div class="step-title"><span class="step-no">1</span><span>账号导入</span><span class="step-sub">支持多种格式和 AWS 文本块</span></div>
+          <div style="margin-bottom:8px"><label>账号格式</label><select id="accountMode"><option value="auto" selected>自动识别（兼容 login=/onetime password=、AWS 文本块、email:password 等）</option><option value="fixed">固定格式：每行 “账号 密码 2fa(可空)” 空格分隔</option></select></div>
           <textarea id="accounts" placeholder="每行一个：&#10;user@example.com:Password123&#10;user2@example.com|Password123|http://proxy:8080&#10;&#10;也可整段粘贴 AWS access portal 文本块：&#10;Default AWS access portal URL (IPv4 only): https://d-xxx.awsapps.com/start&#10;Username: xxxxx&#10;One-time password: yyyyy&#10;&#10;或 mmostore 块格式：&#10;login = neueorgjuni2147 / onetime password = uKV0y)_...&#10;2fa验 FIB3J655XDKKQZQBQJ466X65BNWJGLBR"></textarea>
           <div class="micro" id="fixedHint" style="display:none;margin-top:6px">固定格式下每行：账号 密码 2fa（第三列可空），以空格分隔；此模式下密码不能含空格。</div>
           <div class="parse-preview" id="parsePreview">
@@ -92,7 +90,7 @@
         </div>
 
         <div class="form-section step-card">
-          <div class="step-title"><span class="step-no">2</span><span>配置</span><span class="step-sub">常用项</span></div>
+          <div class="step-title"><span class="step-no">2</span><span>必要配置</span><span class="step-sub">一般只改这几项</span></div>
           <div class="grid2">
             <div><label>IDC Start URL</label><input id="startUrl" value="" placeholder="{{ default_start_url }}" required></div>
             <div><label>密码模式</label><select id="passwordMode"><option value="random" selected>每号随机</option><option value="fixed">固定密码</option></select></div>
@@ -101,32 +99,32 @@
             <label>首次登录新密码（固定模式使用）</label><input id="newPassword" value="{{ default_new_password }}">
           </div>
           <div class="grid2 compact-fields" style="margin-top:10px">
-            <div><label>OIDC Region</label><select id="oidcRegion"><option selected>us-east-1</option><option>eu-central-1</option><option>eu-west-1</option><option>ap-southeast-1</option></select></div>
-            <div><label>Kiro Region</label><select id="kiroRegion"><option selected>us-east-1</option><option>eu-central-1</option><option>eu-west-1</option><option>ap-southeast-1</option></select></div>
+            <div><label>OIDC Region</label><select id="oidcRegion"><option selected>us-east-1</option><option>eu-central-1</option><option>eu-west-1</option><option>ap-southeast-1</option></select><div class="hint">IAM Identity Center 登录区域，填错会授权失败。</div></div>
+            <div><label>Kiro Region</label><select id="kiroRegion"><option selected>us-east-1</option><option>eu-central-1</option><option>eu-west-1</option><option>ap-southeast-1</option></select><div class="hint">Kiro profile/API Key 所在区域。</div></div>
+          </div>
+          <div class="grid2 compact-fields" style="margin-top:10px">
+            <div><label>并行登录数</label><select id="threads"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option selected>10</option></select><div class="hint">默认 10；如果代理或 AWS 页面不稳，可降到 5-6。</div></div>
+            <div><label>单账号超时</label><input id="loginTimeout" type="number" min="60" max="600" step="10" value="180"></div>
           </div>
         </div>
 
         <div class="form-section step-card">
-          <div class="step-title"><span class="step-no">3</span><span>输出</span><span class="step-sub">下载与 Key</span></div>
+          <div class="step-title"><span class="step-no">3</span><span>输出设置</span><span class="step-sub">控制导出文件与 API Key</span></div>
           <div class="checkgrid">
             <label class="checkline"><input id="createApiKeys" type="checkbox"><span>同步创建 API Key<br><span class="micro">生成 JSON + rawKey 文件</span></span></label>
             <label class="checkline"><input id="apiKeyOnly" type="checkbox"><span>仅创建 API Key<br><span class="micro">不生成凭据 JSON</span></span></label>
+            <label class="checkline"><input id="strictProbe" type="checkbox"><span>严格探测<br><span class="micro">更慢，可提前发现封禁</span></span></label>
           </div>
           <div class="grid2" style="margin-top:10px">
-            <div><label>拆分 ZIP：每个文件包含账号数</label><input id="splitAccountsPerFile" type="number" min="1" max="1000" step="1" value="1"><div class="hint">1 = 每账号一个 JSON；10 = 每 10 个账号一个 JSON。</div></div>
+            <div><label>拆分 ZIP：每个文件包含账号数</label><input id="splitAccountsPerFile" type="number" min="1" max="1000" step="1" value="1"><div class="hint">任务完成后会出现「下载拆分 ZIP」按钮；1 = 每账号一个 JSON，10 = 每 10 个账号一个 JSON。</div></div>
             <div id="apiKeyOptions" style="display:none"><label>API Key 标签</label><input id="apiKeyLabel" value="1" maxlength="80"><div class="hint">同步/仅创建 API Key 时使用。</div></div>
           </div>
         </div>
         <details class="advanced">
-          <summary>高级设置</summary>
+          <summary>可选项 / 高级功能</summary>
           <div class="advanced-body">
-            <div class="grid2 compact-fields">
-              <div><label>并行登录数</label><select id="threads"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option selected>10</option></select></div>
-              <div><label>单账号超时</label><input id="loginTimeout" type="number" min="60" max="600" step="10" value="180"></div>
-            </div>
-            <label class="checkline" style="border-radius:14px"><input id="strictProbe" type="checkbox"><span>严格探测<span class="micro"> · 更慢，可提前发现封禁</span></span></label>
             <details class="advanced">
-              <summary>JSON ZIP 开通 API Key</summary>
+              <summary>上传 JSON ZIP 开通 API Key</summary>
               <div class="advanced-body upload-compact">
                 <div>
                   <label>JSON ZIP</label>
@@ -156,7 +154,7 @@
 
     <section class="card">
       <div class="card-head">
-        <div><h2 class="card-title">任务控制台</h2><p class="card-desc">查看进度，完成后下载结果。</p></div>
+        <div><h2 class="card-title">任务控制台</h2><p class="card-desc">实时进度、下载出口和简化日志集中在这里。</p></div>
         <span class="pill" id="jobId">未开始</span>
       </div>
       <div class="card-body">
@@ -169,13 +167,13 @@
         <div class="progress"><div id="progressBar"></div></div>
         <div id="taskSummary" class="task-summary"></div>
         <div class="download-strip">
-          <div id="doneNote" class="done-note">任务完成，文件保留 60 分钟，请及时下载。</div>
+          <div id="doneNote" class="done-note">任务已完成，可在下方下载结果文件。</div>
           <a id="downloadMobile" class="button secondary" href="#" style="display:none">JSON</a>
           <button id="downloadSplitMobile" class="secondary" type="button" style="display:none">按数量下载拆分 ZIP</button>
           <a id="downloadApiKeysMobile" class="button secondary" href="#" style="display:none">API Key</a>
           <a id="downloadMfaMobile" class="button secondary" href="#" style="display:none">MFA</a>
           <a id="downloadLogsMobile" class="button secondary" href="#" style="display:none">日志</a>
-          <span id="downloadEmpty" class="muted">完成后显示下载</span>
+          <span id="downloadEmpty" class="muted">完成后显示 JSON / 拆分 ZIP / API Key / MFA / 日志下载</span>
         </div>
         <div id="resultPanel" class="result-panel">
           <div class="result-head">
@@ -193,7 +191,7 @@
             </table>
           </div>
         </div>
-        <details class="log-details">
+        <details class="log-details" open>
           <summary>查看运行日志</summary>
           <div class="filterbar" id="logFilters">
             <button type="button" class="active" data-filter="all">全部</button>
