@@ -527,21 +527,27 @@ def kiro_mgmt_call(
     target: str,
     extra: Optional[dict] = None,
     timeout: float = 30.0,
+    token_type: Optional[str] = None,
 ) -> tuple[int, dict]:
     body = {"profileArn": profile_arn}
     if extra:
         body.update(extra)
     raw = json.dumps(body).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/x-amz-json-1.0",
+        "X-Amz-Target": target,
+        "Accept": "application/json",
+    }
+    # 外部 IdP（M365/Entra）token 必须携 EXTERNAL_IDP，否则管理面返回
+    # 400 AccessDeniedException "Invalid token"。
+    if token_type:
+        headers["tokentype"] = token_type
     req = urllib.request.Request(
         kiro_mgmt_url(region),
         data=raw,
         method="POST",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/x-amz-json-1.0",
-            "X-Amz-Target": target,
-            "Accept": "application/json",
-        },
+        headers=headers,
     )
     ctx = ssl.create_default_context()
     try:
@@ -556,8 +562,8 @@ def kiro_mgmt_call(
             return e.code, {"_raw": txt}
 
 
-def get_profile(access_token: str, profile_arn: str, region: str) -> tuple[int, dict]:
-    return kiro_mgmt_call(access_token, profile_arn, region, KIRO_MGMT_TARGET_GET_PROFILE)
+def get_profile(access_token: str, profile_arn: str, region: str, token_type: Optional[str] = None) -> tuple[int, dict]:
+    return kiro_mgmt_call(access_token, profile_arn, region, KIRO_MGMT_TARGET_GET_PROFILE, token_type=token_type)
 
 
 def api_keys_enabled(profile_response: dict) -> bool:
@@ -569,12 +575,12 @@ def api_keys_enabled(profile_response: dict) -> bool:
     )
 
 
-def list_api_keys(access_token: str, profile_arn: str, region: str) -> tuple[int, dict]:
-    return kiro_mgmt_call(access_token, profile_arn, region, KIRO_MGMT_TARGET_LIST_KEYS)
+def list_api_keys(access_token: str, profile_arn: str, region: str, token_type: Optional[str] = None) -> tuple[int, dict]:
+    return kiro_mgmt_call(access_token, profile_arn, region, KIRO_MGMT_TARGET_LIST_KEYS, token_type=token_type)
 
 
-def create_api_key(access_token: str, profile_arn: str, region: str, label: str) -> tuple[int, dict]:
-    return kiro_mgmt_call(access_token, profile_arn, region, KIRO_MGMT_TARGET_CREATE_KEY, {"label": label})
+def create_api_key(access_token: str, profile_arn: str, region: str, label: str, token_type: Optional[str] = None) -> tuple[int, dict]:
+    return kiro_mgmt_call(access_token, profile_arn, region, KIRO_MGMT_TARGET_CREATE_KEY, {"label": label}, token_type=token_type)
 
 
 def refresh_access_token(

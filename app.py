@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from flask import Flask, jsonify, make_response, redirect, render_template, request, send_file, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -1307,15 +1307,15 @@ def check_profile_available(exp: dca.DurableExport, profile: dict[str, str], str
     return ""
 
 
-def create_api_key_export(exp: dca.DurableExport, email: str, profile: dict[str, str], label: str, log) -> str:
+def create_api_key_export(exp: dca.DurableExport, email: str, profile: dict[str, str], label: str, log, token_type: Optional[str] = None) -> str:
     arn = profile["arn"]
     region = profile.get("region") or dca.region_from_profile_arn(arn) or exp.region
-    status, profile_data = dca.get_profile(exp.access_token, arn, region)
+    status, profile_data = dca.get_profile(exp.access_token, arn, region, token_type=token_type)
     if status >= 400:
         raise RuntimeError(f"GetProfile HTTP {status}: {str(profile_data)[:200]}")
     if not dca.api_keys_enabled(profile_data):
         raise RuntimeError("该 profile 未开启 API Keys 功能，请先在 Kiro 门户开启")
-    status, created = dca.create_api_key(exp.access_token, arn, region, label)
+    status, created = dca.create_api_key(exp.access_token, arn, region, label, token_type=token_type)
     if status >= 400 or not created.get("rawKey"):
         raise RuntimeError(f"CreateApiKey HTTP {status}: {str(created)[:200]}")
     raw_key = created.get("rawKey") or ""
@@ -1517,8 +1517,26 @@ def run_one_m365(job: Job, acc: AccountInput, options: dict[str, Any]) -> Accoun
     exported: list[dict[str, Any]] = []
     for profile in profiles:
         exported.append(flatten_export_m365(result, acc.email, profile, 0, acc.password, acc.mfa_secret))
-    log(f"账号处理完成：profile {len(exported)} 个")
-    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个", False, exported, [], acc.mfa_secret)
+
+    # API Key 开通：M365/外部 IdP token 调管理面（GetProfile/CreateApiKey）
+    # 必须携 tokentype=EXTERNAL_IDP，否则返回 400 "Invalid token"。
+    api_keys: list[str] = []
+    if options.get("create_api_keys") or options.get("api_key_only"):
+        api_label = options.get("api_key_label") or "1"
+        for profile in profiles:
+            try:
+                api_keys.append(create_api_key_export(
+                    result, acc.email, profile, api_label, log, token_type="EXTERNAL_IDP"))
+            except Exception as exc:
+                log(f"API Key 创建失败：{exc}")
+                return AccountResult(
+                    acc.idx, acc.email, False,
+                    f"登录成功但 API Key 创建失败：{exc}",
+                    False, exported, api_keys, acc.mfa_secret,
+                )
+    suffix = f"，apiKeys={len(api_keys)}" if (options.get("create_api_keys") or options.get("api_key_only")) else ""
+    log(f"账号处理完成：profile {len(exported)} 个{suffix}")
+    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个{suffix}", False, exported, api_keys, acc.mfa_secret)
 
 
 def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResult:
