@@ -31,6 +31,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import device_code_auth as dca
 import idc_browser_login as idc
+import m365_sso_login as m365
+import m365_browser_login as m365b
 
 
 def _resource_root() -> Path:
@@ -100,6 +102,28 @@ MAX_BROWSER_SLOTS_GLOBAL = 20
 MAX_QUEUED_JOBS_PER_CUSTOMER = 6
 MAX_TOTAL_JOBS_GLOBAL = 60
 SCHEDULER_INTERVAL_SECONDS = 2
+# M365/SSO 回环端口池：每个并发登录占一个端口（避免写死 3128 导致并发冲突）。
+# 全局上限 MAX_BROWSER_SLOTS_GLOBAL(20) 已限制总浏览器并发，端口区间留足余量。
+M365_PORT_BASE = 3130
+M365_PORT_RANGE = 60
+M365_PORT_LOCK = threading.Lock()
+M365_PORTS_IN_USE: set[int] = set()
+
+
+def acquire_m365_port() -> int:
+    """从端口池分配一个空闲回环端口；用完务必 release。"""
+    with M365_PORT_LOCK:
+        for offset in range(M365_PORT_RANGE):
+            port = M365_PORT_BASE + offset
+            if port not in M365_PORTS_IN_USE:
+                M365_PORTS_IN_USE.add(port)
+                return port
+    raise RuntimeError("M365 回环端口池已耗尽（并发过高）")
+
+
+def release_m365_port(port: int) -> None:
+    with M365_PORT_LOCK:
+        M365_PORTS_IN_USE.discard(port)
 DEFAULT_START_URL = idc.DEFAULT_IDC_START_URL
 DEFAULT_NEW_PASSWORD = idc.DEFAULT_NEW_PASSWORD
 PROFILE_SCAN_REGIONS = ("us-east-1", "eu-central-1")
@@ -1214,6 +1238,49 @@ def flatten_export(
     }
 
 
+def flatten_export_m365(
+    result: "m365.M365LoginResult",
+    email: str,
+    profile: dict[str, str],
+    priority: int,
+    password: str = "",
+    mfa_secret: str = "",
+) -> dict[str, Any]:
+    """将 M365 / 外部 IdP 登录结果展平为与 IdC 路径一致的导出结构。
+
+    外部 IdP 是 public client + PKCE，**没有 clientSecret**；刷新依赖
+    token_endpoint + issuer_url + scopes，所以额外携带这些字段。
+    """
+    arn = profile["arn"]
+    api_region = profile.get("region") or m365.region_from_profile_arn(arn) or result.region
+    return {
+        "email": email,
+        "username": email,
+        "account": email,
+        "password": password,
+        "mfaSecret": mfa_secret,
+        "idp": "Enterprise",
+        "profileArn": arn,
+        "machineId": machine_id_for(email, arn),
+        "priority": priority,
+        "status": "active",
+        "accessToken": result.access_token,
+        "refreshToken": result.refresh_token,
+        "clientId": result.client_id,
+        "clientSecret": "",
+        "authMethod": "external_idp",
+        "provider": "Enterprise",
+        "region": result.region,
+        "authRegion": result.region,
+        "apiRegion": api_region,
+        "startUrl": "",
+        "issuerUrl": result.issuer_url,
+        "tokenEndpoint": result.token_endpoint,
+        "scopes": result.scopes,
+        "expiresAt": expires_at_ms(time.time() + result.expires_in) if result.expires_in else 0,
+    }
+
+
 def describe_kiro_profile_error(status: int, data: dict[str, Any]) -> str:
     message = str(data.get("message") or data.get("Message") or data.get("_raw") or data)
     reason = str(data.get("reason") or data.get("Reason") or "")
@@ -1385,7 +1452,79 @@ def run_json_api_key_job(job: Job, rows: list[dict[str, str]], options: dict[str
         SCHEDULER_WAKE.set()
 
 
+def run_one_m365(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResult:
+    """M365 / 外部 IdP（Entra ID）SSO 单账号登录。
+
+    流程：app.kiro.dev/signin → Your organization → 填邮箱 → M365 密码[+MFA]
+    → 回环回调 → 换 token → ListAvailableProfiles。不涉及改密/start_url。
+    """
+    prefix = f"#{acc.idx} {acc.email}"
+
+    def log(message: str) -> None:
+        job.log(f"{prefix}: {message}")
+
+    if job.stop_event.is_set():
+        return AccountResult(acc.idx, acc.email, False, "已中断（任务被手动停止，未执行）")
+
+    debug_dir = Path(__file__).parent / "debug_mfa" / job.id / f"{acc.idx:03d}"
+    try:
+        port = acquire_m365_port()
+    except RuntimeError as exc:
+        return AccountResult(acc.idx, acc.email, False, str(exc))
+
+    log("开始 M365 SSO 登录")
+    sess = m365.M365LoginSession(port=port, proxy_url=acc.proxy or None,
+                                 region=options["kiro_region"], log=log)
+    try:
+        signin_url = sess.start()
+    except RuntimeError as exc:
+        release_m365_port(port)
+        return AccountResult(acc.idx, acc.email, False, f"启动回环监听失败：{exc}")
+
+    drv: dict[str, Any] = {}
+
+    def drive() -> None:
+        ok, err = m365b.drive_m365_login(
+            signin_url, acc.email, acc.password,
+            mfa_secret=acc.mfa_secret, log=log, headless=options["headless"],
+            proxy=acc.proxy, timeout_s=options["login_timeout"],
+            stop_event=job.stop_event, debug_dir=str(debug_dir),
+        )
+        drv["ok"] = ok
+        drv["err"] = err
+
+    th = threading.Thread(target=drive, daemon=True)
+    th.start()
+    try:
+        result = sess.wait_and_exchange(timeout=options["login_timeout"] + 10, stop_event=job.stop_event)
+    finally:
+        sess.close()
+        th.join(timeout=10)
+        release_m365_port(port)
+
+    if not result.ok:
+        drv_err = drv.get("err") or ""
+        # 浏览器側错误更贴近根因（密码错/MFA），优先报它
+        msg = drv_err or result.error
+        log(f"登录失败：{msg}")
+        return AccountResult(acc.idx, acc.email, False, msg)
+
+    log(f"登录成功，profile={result.profile_arn.split('/')[-1] if result.profile_arn else '?'}")
+    profiles = result.profiles or ([{"arn": result.profile_arn, "region": result.region}] if result.profile_arn else [])
+    if not profiles:
+        return AccountResult(acc.idx, acc.email, False, "登录成功但未获取到 profileArn")
+
+    exported: list[dict[str, Any]] = []
+    for profile in profiles:
+        exported.append(flatten_export_m365(result, acc.email, profile, 0, acc.password, acc.mfa_secret))
+    log(f"账号处理完成：profile {len(exported)} 个")
+    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个", False, exported, [], acc.mfa_secret)
+
+
 def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResult:
+    # M365 / 外部 IdP 路径：完全不同的登录编排，早路由出去。
+    if options.get("login_mode") == "m365":
+        return run_one_m365(job, acc, options)
     prefix = f"#{acc.idx} {acc.email}"
 
     def log(message: str) -> None:
@@ -1895,10 +2034,15 @@ def create_job():
     if len(accounts) > MAX_ACCOUNTS_PER_JOB:
         return jsonify({"error": f"单次最多提交 {MAX_ACCOUNTS_PER_JOB} 个账号"}), 400
     raw_accounts_text = payload.get("accounts", "")
-    raw_start_url = (payload.get("startUrl") or "").strip() or extract_start_url_from_accounts_text(raw_accounts_text)
-    ok_start_url, start_url_or_error = validate_start_url(raw_start_url)
-    if not ok_start_url:
-        return jsonify({"error": start_url_or_error}), 400
+    login_mode = "m365" if (payload.get("loginMode") or "idc") == "m365" else "idc"
+    if login_mode == "m365":
+        # M365/外部 IdP 不需要 start_url（门户做 home realm discovery）
+        start_url_or_error = ""
+    else:
+        raw_start_url = (payload.get("startUrl") or "").strip() or extract_start_url_from_accounts_text(raw_accounts_text)
+        ok_start_url, start_url_or_error = validate_start_url(raw_start_url)
+        if not ok_start_url:
+            return jsonify({"error": start_url_or_error}), 400
     create_api_keys = bool(payload.get("createApiKeys", False))
     api_key_only = bool(payload.get("apiKeyOnly", False))
     if create_api_keys and api_key_only:
@@ -1913,6 +2057,7 @@ def create_job():
         fixed_new_password, _ = normalize_fullwidth_symbols(fixed_new_password)
     options = {
         "start_url": start_url_or_error,
+        "login_mode": login_mode,
         "oidc_region": dca.normalize_oidc_region(payload.get("oidcRegion") or dca.DEFAULT_OIDC_REGION),
         "kiro_region": dca.normalize_kiro_region(payload.get("kiroRegion") or dca.DEFAULT_KIRO_REGION),
         "new_password": fixed_new_password,
