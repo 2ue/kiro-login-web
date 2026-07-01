@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import ssl
@@ -33,6 +34,7 @@ import device_code_auth as dca
 import idc_browser_login as idc
 import m365_sso_login as m365
 import m365_browser_login as m365b
+import mihomo_controller as mihomo
 
 
 def _resource_root() -> Path:
@@ -82,6 +84,24 @@ JOBS: dict[str, "Job"] = {}
 JOBS_LOCK = threading.RLock()
 # 调度器唤醒事件：提交/完成任务后置位，让调度器立即检查是否有可启动的排队任务。
 SCHEDULER_WAKE = threading.Event()
+
+
+def is_captcha_error(msg: str) -> bool:
+    """是否是 AWS 人机验证/风控类错误（需换 IP + 等待重试）。"""
+    m = (msg or "").lower()
+    return any(k in m for k in ("captcha", "验证码", "are you human", "robot",
+                                "too many", "rate", "风控", "suspicious", "unusual"))
+
+
+def is_proxy_conn_error(msg: str) -> bool:
+    """是否是代理连接失败（瞬时性，重试或换节点即可）。"""
+    m = (msg or "").lower()
+    return any(k in m for k in ("err_proxy_connection_failed", "err_tunnel_connection_failed",
+                                "err_connection_reset", "err_connection_closed",
+                                "err_connection_refused", "err_timed_out",
+                                "econnrefused", "socks", "proxy"))
+
+
 CUSTOMERS_PATH = Path(__file__).parent / "customers.json"
 CUSTOMERS_LOCK = threading.RLock()
 HISTORY_PATH = Path(__file__).parent / "data" / "job_history.json"
@@ -148,6 +168,10 @@ BLOCK_2FA_RE = re.compile(
 SIMPLE_SLASH_RE = re.compile(r"^\s*(\S+)\s+/\s+(.+?)\s*$")
 KIRO_PROFILE_API_VERSION = "0.12.333"
 BLOCKED_PROXY_HOSTS = ("127.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "192.168.", "localhost", "0.0.0.0", "::1")
+# 服务端可信默认代理（管理员通过 env 配置）：套给所有未单独指定代理的账号。
+# 与用户输入的代理池不同：这是管理员自己配的，允许回环地址（如本机 mihomo 127.0.0.1:7890），
+# 绕过 SSRF 回环黑名单（黑名单只防用户乱填内网地址）。例：http://127.0.0.1:7890
+DEFAULT_PROXY = (os.environ.get("KIRO_DEFAULT_PROXY", "") or "").strip()
 
 logger = logging.getLogger("kiro-login-web")
 logger.setLevel(logging.INFO)
@@ -389,6 +413,7 @@ def account_result_to_dict(result: "AccountResult") -> dict[str, Any]:
         "exportedCount": len(result.exported),
         "apiKeyCount": len(result.api_keys),
         "mfaSecret": result.mfa_secret,
+        "finalPassword": result.final_password,
     }
 
 
@@ -435,6 +460,7 @@ def save_job_history() -> None:
                     "export_split_zip_path": job.export_split_zip_path,
                     "api_keys_path": job.api_keys_path,
                     "mfa_secrets_path": job.mfa_secrets_path,
+                    "accounts_pw_path": job.accounts_pw_path,
                     "log_path": job.log_path,
                     "total": job.total,
                     "threads": job.threads,
@@ -488,6 +514,7 @@ def restore_job_history() -> None:
                     export_split_zip_path=item.get("export_split_zip_path") or "",
                     api_keys_path=item.get("api_keys_path") or "",
                     mfa_secrets_path=item.get("mfa_secrets_path") or "",
+                    accounts_pw_path=item.get("accounts_pw_path") or "",
                     log_path=item.get("log_path") or "",
                     total=int(item.get("total") or 0),
                     threads=int(item.get("threads") or 1),
@@ -506,6 +533,7 @@ def restore_job_history() -> None:
                         result.get("message") or "",
                         bool(result.get("changedPassword")),
                         mfa_secret=result.get("mfaSecret") or "",
+                        final_password=result.get("finalPassword") or "",
                     ))
                 job.accounts = [
                     account_input_from_dict(account, idx + 1)
@@ -660,6 +688,7 @@ class AccountResult:
     exported: list[dict[str, Any]] = field(default_factory=list)
     api_keys: list[str] = field(default_factory=list)
     mfa_secret: str = ""   # 本次登录绑定的新 MFA 密钥（如有）
+    final_password: str = ""   # 登录成功后账号的最终密码（改密则为新密码，否则为原密码）
 
 
 @dataclass
@@ -676,6 +705,7 @@ class Job:
     export_split_zip_path: str = ""
     api_keys_path: str = ""
     mfa_secrets_path: str = ""
+    accounts_pw_path: str = ""
     log_path: str = ""
     total: int = 0
     threads: int = 1
@@ -1100,7 +1130,7 @@ def build_split_export_zip(export_path: str, zip_path: str, accounts_per_file: i
     return (len(groups) + accounts_per_file - 1) // accounts_per_file if groups else 0
 
 
-def sanitize_proxy(proxy: str) -> str:
+def sanitize_proxy(proxy: str, allow_loopback: bool = False) -> str:
     proxy = (proxy or "").strip()
     if not proxy:
         return ""
@@ -1108,9 +1138,62 @@ def sanitize_proxy(proxy: str) -> str:
     if not lowered.startswith(("http://", "https://", "socks5://")):
         return ""
     host = lowered.split("://", 1)[1].split("/", 1)[0].split("@")[-1].split(":", 1)[0].strip("[]")
-    if any(host == blocked or host.startswith(blocked) for blocked in BLOCKED_PROXY_HOSTS):
+    if not allow_loopback and any(host == blocked or host.startswith(blocked) for blocked in BLOCKED_PROXY_HOSTS):
         return ""
     return proxy
+
+
+def sanitized_default_proxy() -> str:
+    """服务端默认代理（env KIRO_DEFAULT_PROXY），允许本机回环。无效返回空。"""
+    return sanitize_proxy(DEFAULT_PROXY, allow_loopback=True)
+
+
+def apply_default_proxy(accounts: list["AccountInput"]) -> tuple[str, int]:
+    """把服务端默认代理套给所有「未单独指定代理」的账号。
+    返回 (代理字符串, 套了多少个)。应在 apply_proxy_pool 之后调用作为兑底。"""
+    dp = sanitized_default_proxy()
+    if not dp:
+        return "", 0
+    n = 0
+    for acc in accounts:
+        if not acc.proxy:
+            acc.proxy = dp
+            n += 1
+    return dp, n
+
+
+def parse_proxy_pool(text: str) -> list[str]:
+    """解析代理池文本（每行一个），返回合法代理列表。
+    支持 http(s)://[user:pass@]host:port 和 socks5://...。
+    未带 scheme 的裸 host:port 自动补 http:// 再校验。空行/#注释忽略。
+    """
+    pool: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "://" not in line:
+            line = "http://" + line
+        ok = sanitize_proxy(line)
+        if ok and ok not in pool:
+            pool.append(ok)
+    return pool
+
+
+def apply_proxy_pool(accounts: list["AccountInput"], pool: list[str]) -> int:
+    """把代理池轮流（round-robin）分配给「未单独指定代理」的账号。
+    已在账号行里写了代理的不覆盖。返回分配了多少个。"""
+    if not pool:
+        return 0
+    assigned = 0
+    i = 0
+    for acc in accounts:
+        if acc.proxy:
+            continue
+        acc.proxy = pool[i % len(pool)]
+        i += 1
+        assigned += 1
+    return assigned
 
 
 def post_json(url: str, body: dict[str, Any], headers: dict[str, str], timeout: float = 30.0) -> tuple[int, dict[str, Any]]:
@@ -1132,6 +1215,10 @@ def post_json(url: str, body: dict[str, Any], headers: dict[str, str], timeout: 
         except Exception:
             data = {"_raw": text}
         return exc.code, data
+    except urllib.error.URLError as exc:
+        # DNS 解析失败 / 连接错误（如选错 Kiro Region 拼出不存在的域名 q.<region>.amazonaws.com）。
+        # 不再让异常冒泡炸掉整个任务——返回合成 599 状态，由调用方按 >=400 跳到下一个区域。
+        return 599, {"_raw": f"URLError: {exc.reason}"}
 
 
 def list_profiles_all_regions(access_token: str, preferred_region: str, log, exhaustive: bool = False) -> list[dict[str, str]]:
@@ -1466,6 +1553,7 @@ def run_one_m365(job: Job, acc: AccountInput, options: dict[str, Any]) -> Accoun
     if job.stop_event.is_set():
         return AccountResult(acc.idx, acc.email, False, "已中断（任务被手动停止，未执行）")
 
+    # 效率优先：不做启动错峰等待；若触发风控/验证码，失败后立即换 IP 重试。
     debug_dir = Path(__file__).parent / "debug_mfa" / job.id / f"{acc.idx:03d}"
     try:
         port = acquire_m365_port()
@@ -1552,6 +1640,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     if job.stop_event.is_set():
         return AccountResult(acc.idx, acc.email, False, "已中断（任务被手动停止，未执行）")
 
+    # 效率优先：不做启动错峰等待；若触发风控/验证码，失败后立即换 IP 重试。
     # MFA 密钥早期落盘：抠到密钥的瞬间立刻完整写盘（不脱敏、不等绑定结果）。
     # 即使后续被取消/超时/AWS 卡住/进程崩溃，密钥也已安全保存到下面这个文件。
     # 文件名带 -early- 区分；最终绑定成功的密钥仍走原 kiro-mfa-secrets-{job}.txt。
@@ -1588,6 +1677,28 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         except Exception as exc:
             log(f"MFA 密钥落盘失败：{exc}")
 
+    # 改密后的新密码立刻落盘：改密成功的瞬间就把新密码写进独立文件（不等导出步骤）。
+    # 即使后续扫 profile / 取 token / 进程崩溃，新密码也已安全保存，账号不会变成「未知密码」死号。
+    early_pw_path = out_dir / f"kiro-changed-passwords-{job.id}.txt"
+    saved_pw: dict[str, bool] = {"done": False}
+
+    def _save_password_early(new_pw: str) -> None:
+        if not new_pw or saved_pw["done"]:
+            return
+        try:
+            with early_pw_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"{acc.email}:{new_pw}\n")
+            try:
+                early_pw_path.chmod(0o600)
+            except Exception:
+                pass
+            saved_pw["done"] = True
+            log(f"新密码已立刻落盘：{early_pw_path.name}（改密成功即保存，防丢号）")
+            save_job_history()
+            audit("password.early_saved", jobId=job.id, customerId=job.customer_id, email=acc.email)
+        except Exception as exc:
+            log(f"新密码落盘失败：{exc}")
+
     log("开始登录")
     start = dca.register_and_start(
         oidc_region=options["oidc_region"],
@@ -1621,6 +1732,40 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
         )
 
     outcome = _drive_once(start.verification_uri_complete, new_password)
+    if outcome.changed_password:
+        _save_password_early(new_password)
+
+    # 风控规避：撞 captcha / 代理连接失败 → 立即换出口 IP(切 mihomo 节点) + 重新取登录URL + 重试。
+    # 效率第一：不再做 30~90s 随机等待，也不做代理错误指数退避；失败后直接换 IP 快速推进。
+    rc_max = int(options.get("risk_retry", 3) or 3)
+    rc_attempt = 0
+    while (not outcome.ok and rc_attempt < rc_max
+           and not (job.stop_event and job.stop_event.is_set())
+           and (is_captcha_error(outcome.error) or is_proxy_conn_error(outcome.error))):
+        rc_attempt += 1
+        reason = "验证码/风控" if is_captcha_error(outcome.error) else "代理连接异常"
+        log(f"{reason}，立即换 IP 重试（第 {rc_attempt}/{rc_max} 次）")
+        if job.stop_event and job.stop_event.is_set():
+            break
+        # 换出口 IP(需配了 mihomo 控制器)
+        if mihomo.enabled():
+            mihomo.pick_and_switch(exclude=mihomo.current_node(), log=log)
+        # 重新获取登录 URL(旧 device code 已失效)
+        start_rc = dca.register_and_start(
+            oidc_region=options["oidc_region"],
+            kiro_region=options["kiro_region"],
+            start_url=options["start_url"],
+            log=log,
+        )
+        if not start_rc.ok:
+            log(f"风控重试时重新获取登录 URL 失败：{start_rc.error}")
+            break
+        start = start_rc
+        log(f"风控规避重试（第 {rc_attempt}/{rc_max} 次）")
+        outcome = _drive_once(start.verification_uri_complete, new_password)
+        if outcome.changed_password:
+            _save_password_early(new_password)
+
     if (not outcome.ok
             and outcome.changed_password
             and looks_like_password_policy_error(outcome.error)
@@ -1637,6 +1782,8 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             log(f"重新获取登录 URL 失败：{start_retry.error}")
             return AccountResult(acc.idx, acc.email, False, start_retry.error, outcome.changed_password)
         retry_outcome = _drive_once(start_retry.verification_uri_complete, retry_password)
+        if retry_outcome.changed_password:
+            _save_password_early(retry_password)
         if retry_outcome.ok:
             log("自动重试改密成功")
             start = start_retry
@@ -1666,7 +1813,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             acc.idx,
             acc.email,
             False,
-            "登录成功但未获取到 profileArn；已扫描 us-east-1/eu-central-1",
+            "登录成功但未获取到 profileArn（已扫描首选区 + us-east-1/eu-central-1；若首选区域错误已自动回退）",
             outcome.changed_password,
         )
 
@@ -1700,7 +1847,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     if outcome.mfa_secret:
         suffix += "，已绑定 MFA"
     log(f"账号处理完成：profile {len(exported)} 个{suffix}")
-    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个{suffix}", outcome.changed_password, exported, api_keys, outcome.mfa_secret)
+    return AccountResult(acc.idx, acc.email, True, f"完成：profile {len(exported)} 个{suffix}", outcome.changed_password, exported, api_keys, outcome.mfa_secret, final_password=export_password)
 
 
 def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> None:
@@ -1787,6 +1934,14 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
             mfa_path.chmod(0o600)
             job.mfa_secrets_path = str(mfa_path)
             job.log(f"本次新绑定 MFA 账号 {len(mfa_lines)} 个，密钥已导出（务必下载保存）")
+        # 一键提取账号密码：所有登录成功的账号 email:password（密码为改密后的最终密码）
+        pw_lines = [f"{r.email}:{r.final_password}" for r in job.results if r.ok and r.email and r.final_password]
+        if pw_lines:
+            accounts_pw_path = out_dir / f"kiro-accounts-passwords-{job.id}.txt"
+            accounts_pw_path.write_text("\n".join(pw_lines) + "\n", encoding="utf-8")
+            accounts_pw_path.chmod(0o600)
+            job.accounts_pw_path = str(accounts_pw_path)
+            job.log(f"已生成账号密码提取文件：{len(pw_lines)} 个账号（email:password，可一键下载）")
         if job.stop_requested:
             job.status = "stopped"
             job.log(f"已中断：成功 {job.ok}，失败/跳过 {job.failed}，导出 {0 if options.get('api_key_only') else len(exported_all)} 条，API Key {len(api_keys_all)} 条（未完成的账号可重新提交）")
@@ -1821,6 +1976,7 @@ def job_to_dict(job: Job) -> dict[str, Any]:
             "splitDownloadReady": bool(job.export_path and Path(job.export_path).exists()),
             "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
             "mfaSecretsDownloadReady": bool(job.mfa_secrets_path and Path(job.mfa_secrets_path).exists() and Path(job.mfa_secrets_path).stat().st_size > 0),
+            "accountsPwDownloadReady": bool(job.accounts_pw_path and Path(job.accounts_pw_path).exists() and Path(job.accounts_pw_path).stat().st_size > 0),
             "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
             "createdAt": int(job.created_at),
             "finishedAt": int(job.finished_at or 0),
@@ -1874,6 +2030,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
                 "splitDownloadReady": bool(job.export_path and Path(job.export_path).exists()),
                 "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
                 "mfaSecretsDownloadReady": bool(job.mfa_secrets_path and Path(job.mfa_secrets_path).exists() and Path(job.mfa_secrets_path).stat().st_size > 0),
+                "accountsPwDownloadReady": bool(job.accounts_pw_path and Path(job.accounts_pw_path).exists() and Path(job.accounts_pw_path).stat().st_size > 0),
                 "logDownloadReady": bool(job.log_path and Path(job.log_path).exists()),
                 "retryableCount": retryable_count,
             })
@@ -1882,7 +2039,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
 
 def delete_job_files(job: Job) -> list[str]:
     deleted: list[str] = []
-    for path_attr in ("export_path", "export_split_zip_path", "api_keys_path", "mfa_secrets_path", "log_path"):
+    for path_attr in ("export_path", "export_split_zip_path", "api_keys_path", "mfa_secrets_path", "accounts_pw_path", "log_path"):
         path_value = getattr(job, path_attr, "")
         if path_value:
             try:
@@ -2065,6 +2222,11 @@ def create_job():
     api_key_only = bool(payload.get("apiKeyOnly", False))
     if create_api_keys and api_key_only:
         return jsonify({"error": "同步创建 API Key 和仅创建 API Key 不能同时开启"}), 400
+    # 代理池：粘贴一批代理，轮流分配给未单独指定代理的账号（不同 IP 是解 captcha 最有效的办法）。
+    proxy_pool = parse_proxy_pool(payload.get("proxyPool", ""))
+    proxy_assigned = apply_proxy_pool(accounts, proxy_pool) if proxy_pool else 0
+    # 兑底：仍无代理的账号套服务端默认代理（env KIRO_DEFAULT_PROXY，允许本机回环）。
+    default_proxy, default_proxy_assigned = apply_default_proxy(accounts)
     job_id = secrets.token_hex(8)
     threads = max(1, min(clamp_int(payload.get("threads"), 10, 1, MAX_THREADS_PER_JOB), len(accounts)))
     job = Job(id=job_id, customer_id=customer_id, total=len(accounts), threads=threads, kind="login", uses_browser=True)
@@ -2097,7 +2259,11 @@ def create_job():
         job.options = options
         enqueue_job_locked(job)
     save_job_history()
-    audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], knownMfa=enriched_mfa, ip=client_ip())
+    audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], knownMfa=enriched_mfa, proxyPool=len(proxy_pool), proxyAssigned=proxy_assigned, ip=client_ip())
+    if proxy_pool:
+        job.log(f"代理池：{len(proxy_pool)} 个代理，已轮流分配给 {proxy_assigned} 个账号")
+    if default_proxy_assigned:
+        job.log(f"已为 {default_proxy_assigned} 个无代理账号套用服务端默认代理 {default_proxy}")
     if enriched_mfa:
         job.log(f"已自动复用历史 MFA 密钥 {enriched_mfa} 个；如这些账号已绑定 MFA，可直接完成验证码登录")
     if symbol_fixed:
@@ -2297,6 +2463,19 @@ def download_job_mfa_secrets(job_id: str):
         return jsonify({"error": "MFA 密钥文件不存在"}), 404
     audit("mfa.download", jobId=job.id, customerId=customer_id, path=job.mfa_secrets_path, ip=client_ip())
     return send_file(job.mfa_secrets_path, mimetype="text/plain", as_attachment=True, download_name=f"kiro-mfa-secrets-{job_id}.txt")
+
+
+@app.get("/api/jobs/<job_id>/accounts-passwords/download")
+def download_job_accounts_passwords(job_id: str):
+    cleanup_expired_jobs()
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    job = JOBS.get(job_id)
+    if not job or job.customer_id != customer_id or not job.accounts_pw_path or not Path(job.accounts_pw_path).exists() or Path(job.accounts_pw_path).stat().st_size <= 0:
+        return jsonify({"error": "账号密码文件不存在"}), 404
+    audit("accounts_pw.download", jobId=job.id, customerId=customer_id, path=job.accounts_pw_path, ip=client_ip())
+    return send_file(job.accounts_pw_path, mimetype="text/plain", as_attachment=True, download_name=f"kiro-accounts-passwords-{job_id}.txt")
 
 
 @app.get("/api/jobs/<job_id>/logs/download")
