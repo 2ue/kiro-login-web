@@ -396,7 +396,7 @@ def cleanup_expired_jobs() -> None:
         for job_id in list(JOBS):
             job = JOBS[job_id]
             expired = bool(job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS)
-            for path_attr, event_name in (("export_path", "export.expired_deleted"), ("export_split_zip_path", "export_split.expired_deleted"), ("api_keys_path", "apikeys.expired_deleted"), ("log_path", "joblog.expired_deleted")):
+            for path_attr, event_name in (("export_path", "export.expired_deleted"), ("export_split_zip_path", "export_split.expired_deleted"), ("api_keys_path", "apikeys.expired_deleted"), ("mfa_secrets_path", "mfa.expired_deleted"), ("accounts_pw_path", "accounts_pw.expired_deleted"), ("log_path", "joblog.expired_deleted")):
                 path_value = getattr(job, path_attr, "")
                 if path_value and expired:
                     try:
@@ -405,13 +405,46 @@ def cleanup_expired_jobs() -> None:
                     except Exception:
                         pass
                     setattr(job, path_attr, "")
-            if expired and job.status != "expired" and not job.export_path and not job.export_split_zip_path and not job.api_keys_path and not job.log_path:
+            if expired and job.status != "expired" and not job.export_path and not job.export_split_zip_path and not job.api_keys_path and not job.mfa_secrets_path and not job.accounts_pw_path and not job.log_path:
                 job.status = "expired"
                 job.log("导出文件已超过 60 分钟，已自动删除")
             if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
                 JOBS.pop(job_id, None)
                 audit("job.evicted", jobId=job.id, customerId=job.customer_id)
+    _sweep_orphan_exports(now)
     save_job_history()
+
+
+def _sweep_orphan_exports(now: float) -> None:
+    """目录级兵底：所有导出文件都是 TTL 后即焚的临时产物。
+    回收那些未被 job 属性跟踪（如 early changed-passwords / mfa-secrets-early）
+    或 job 被逐出内存后残留的文件（含明文密码/MFA 密钥，属隐私敏感）。
+    按 mtime 超 TTL 删除；运行中任务文件 mtime 为近期，不会误删。"""
+    try:
+        base = EXPORT_DIR if 'EXPORT_DIR' in globals() else (Path(__file__).parent / "exports")
+        if not base.exists():
+            return
+        removed = 0
+        for path in base.glob("*/kiro-*"):
+            try:
+                if not path.is_file():
+                    continue
+                if now - path.stat().st_mtime > EXPORT_TTL_SECONDS:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            audit("exports.orphan_swept", count=removed)
+        # 清理空的客户子目录（文件均已过期删除后会累积空目录）。
+        for d in base.iterdir():
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("sweep orphan exports failed: %s", exc)
 
 
 def account_result_to_dict(result: "AccountResult") -> dict[str, Any]:
