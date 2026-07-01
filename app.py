@@ -1930,6 +1930,20 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
     password_mode_label = "每号随机" if options.get("password_mode") == "random" else "固定"
     job.log(f"开始任务：账号 {len(accounts)} 个，并发 {threads}，单号超时 {options['login_timeout']} 秒，密码模式：{password_mode_label}")
     audit("job.started", jobId=job.id, customerId=job.customer_id, total=len(accounts), threads=threads, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"])
+    # 出口节点预热：启动前先探测当前 mihomo 出口是否健康。
+    # 若当前节点不通，先切到一个健康节点（一次），避免所有并发账号首次代理连接
+    # 全部失败 → 各自进入换 IP 重试 → 被全局锁串行错峰（实测曾占单号总耗时一半）。
+    if mihomo.enabled():
+        try:
+            cur = mihomo.current_node()
+            d = mihomo.node_delay(cur) if cur else None
+            if d is None:
+                job.log(f"出口节点预热：当前节点 {cur or '(无)'} 不通，启动前先切健康节点")
+                mihomo.pick_and_switch(exclude=cur, log=job.log)
+            else:
+                job.log(f"出口节点预热：当前节点 {cur} 健康（延迟 {d}ms），直接开跑")
+        except Exception as exc:
+            job.log(f"出口节点预热跳过（探测异常：{exc}）")
     exported_all: list[dict[str, Any]] = []
     api_keys_all: list[str] = []
     try:
