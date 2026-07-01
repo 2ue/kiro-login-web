@@ -82,6 +82,12 @@ def add_no_cache_headers(response):
 
 JOBS: dict[str, "Job"] = {}
 JOBS_LOCK = threading.RLock()
+# save_job_history 节流：高频的日志行只做「脏标记 + 最多每 N 秒落盘一次」，
+# 关键状态变更仍用 force=True 立即落盘保证崩溃安全。
+_HISTORY_SAVE_LOCK = threading.Lock()
+_HISTORY_LAST_SAVE = 0.0
+_HISTORY_DIRTY = False
+HISTORY_SAVE_MIN_INTERVAL = 2.0
 # 调度器唤醒事件：提交/完成任务后置位，让调度器立即检查是否有可启动的排队任务。
 SCHEDULER_WAKE = threading.Event()
 
@@ -442,7 +448,26 @@ def account_input_from_dict(item: dict[str, Any], fallback_idx: int) -> "Account
     )
 
 
-def save_job_history() -> None:
+def save_job_history(force: bool = True) -> None:
+    """将 job 历史全量序列化落盘。
+
+    force=True（默认）：关键状态变更（结果完成、改密/MFA 落盘、状态切换等），立即写入。
+    force=False：高频日志行调用，距上次落盘不足 HISTORY_SAVE_MIN_INTERVAL 秒则跳过。
+    （每个 job 已有独立 .txt 日志逐行落盘，job_history.json 里的 logs 仅供前端展示，丢几行无关紧要。）
+    """
+    global _HISTORY_LAST_SAVE, _HISTORY_DIRTY
+    if not force:
+        now = time.time()
+        with _HISTORY_SAVE_LOCK:
+            _HISTORY_DIRTY = True
+            if now - _HISTORY_LAST_SAVE < HISTORY_SAVE_MIN_INTERVAL:
+                return
+            _HISTORY_LAST_SAVE = now
+            _HISTORY_DIRTY = False
+    else:
+        with _HISTORY_SAVE_LOCK:
+            _HISTORY_LAST_SAVE = time.time()
+            _HISTORY_DIRTY = False
     try:
         HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
@@ -745,7 +770,7 @@ class Job:
             except Exception as exc:
                 audit("joblog.write_failed", jobId=self.id, customerId=self.customer_id, path=log_path, error=str(exc))
         logger.info("job.log %s", json.dumps({"jobId": self.id, "customerId": self.customer_id, "message": simplified}, ensure_ascii=False))
-        save_job_history()
+        save_job_history(force=False)
 
 
 def _looks_like_mfa_secret(value: str) -> bool:
