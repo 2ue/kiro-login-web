@@ -57,7 +57,10 @@ def drive_m365_login(
         return stop_event is not None and stop_event.is_set()
 
     launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
-    proxy_cfg = {"server": proxy} if proxy else None
+    # 关键：OAuth 回调重定向到 http://localhost:<port>，必须让回环地址绕过代理，
+    # 否则 Chromium（新版默认不 bypass localhost）会把回调请求也送进出口代理，
+    # 请求到不了本机监听端口 → result_queue 收不到 code → wait_and_exchange 超时。
+    proxy_cfg = {"server": proxy, "bypass": "localhost, 127.0.0.1, ::1, [::1]"} if proxy else None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, args=launch_args, proxy=proxy_cfg)
