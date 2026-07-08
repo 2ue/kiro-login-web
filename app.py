@@ -116,7 +116,9 @@ LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_DIR.chmod(0o700)
 APP_LOG_PATH = LOG_DIR / "app.log"
-EXPORT_TTL_SECONDS = 3600
+EXPORT_TTL_SECONDS = 24 * 3600  # 默认账号数据保留时长（默认 24 小时；可被任务级自定义覆盖）
+MIN_EXPORT_TTL_SECONDS = 5 * 60  # 自定义保留时长下限：5 分钟
+MAX_EXPORT_TTL_SECONDS = 7 * 24 * 3600  # 自定义保留时长上限：7 天（也是孤儿清理的兜底上限）
 CLEANUP_INTERVAL_SECONDS = 30
 MAX_ACCOUNTS_PER_JOB = 50
 MAX_ACTIVE_JOBS_PER_CUSTOMER = 2
@@ -250,12 +252,37 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(password_hash(password), stored)
 
 
+def _lookup_hmac_key() -> bytes:
+    """从 Flask secret 派生一个稳定的 HMAC 密钥，专用于客户密码查找索引。
+    不新增磁盘文件；只要 Flask secret 不变，lookupHash 就稳定。若 secret 重生（探不到），后续登录会回退到慢路径并重写新 hash，自愈。"""
+    return hmac.new(
+        (app.secret_key or "").encode("utf-8"),
+        b"kiro-login-web:customer-lookup:v1",
+        hashlib.sha256,
+    ).digest()
+
+
+def compute_lookup_hash(password: str) -> str:
+    """对密码算确定性查找哈希。相同密码总得到同一个 hash；不同密码基本不碰撞。相同密码的多个客户会共享同一 lookupHash，登录时在这个小子集内再跑 PBKDF2 即可。"""
+    return hmac.new(_lookup_hmac_key(), password.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def migrate_customer_password_hash(customer_id: str, password: str) -> None:
+    """补写无 PBKDF2 旧 hash 的客户；同时回写登录查找索引 lookupHash。
+    两个字段任一缺失就会补写，完全齐备则 no-op（避免无谓磁盘写入）。"""
     raw = read_customers_raw()
     item = raw.get(customer_id)
-    if item and not str(item.get("passwordHash", "")).startswith("pbkdf2_sha256$"):
+    if not item:
+        return
+    changed = False
+    if not str(item.get("passwordHash", "")).startswith("pbkdf2_sha256$"):
         item["passwordHash"] = secure_password_hash(password)
         item.pop("password", None)
+        changed = True
+    if not item.get("lookupHash"):
+        item["lookupHash"] = compute_lookup_hash(password)
+        changed = True
+    if changed:
         save_customers_raw(raw)
 
 
@@ -290,6 +317,7 @@ def load_customers() -> dict[str, dict[str, str]]:
             "id": customer_id,
             "name": item.get("name") or customer_id,
             "passwordHash": hashed,
+            "lookupHash": item.get("lookupHash", "") or "",
         }
     return customers
 
@@ -316,6 +344,7 @@ def create_customer_for_password(password: str, name: str = "") -> dict[str, str
     raw[customer_id] = {
         "name": customer_name,
         "passwordHash": secure_password_hash(password),
+        "lookupHash": compute_lookup_hash(password),
         "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     save_customers_raw(raw)
@@ -395,7 +424,23 @@ def validate_start_url(value: str) -> tuple[bool, str]:
 
 
 def customer_for_password(password: str) -> dict[str, str] | None:
-    for customer in load_customers().values():
+    """按密码查找客户。
+    快路径（O(1)+）：先用密码的 lookupHash 筛选出候选集子集（很小），再对候选跑 PBKDF2 验证。
+    慢路径（回退）：若没有候选（例如老客户未迁移、或 Flask secret 变了），才对未带 lookupHash 的客户全扫。
+    成功后都会调 migrate_customer_password_hash 自愈补写 lookupHash，下次进快路径。
+    """
+    customers = load_customers()
+    target = compute_lookup_hash(password)
+    # 快路径：同一 lookupHash 可能多个客户共享（相同密码），逐个验证
+    for customer in customers.values():
+        if customer.get("lookupHash") and hmac.compare_digest(customer["lookupHash"], target):
+            if verify_password(password, customer["passwordHash"]):
+                migrate_customer_password_hash(customer["id"], password)
+                return customer
+    # 慢路径：对无 lookupHash 的客户全扫（首次迁移 / 密钥旋转后自愈）
+    for customer in customers.values():
+        if customer.get("lookupHash"):
+            continue
         if verify_password(password, customer["passwordHash"]):
             migrate_customer_password_hash(customer["id"], password)
             return customer
@@ -412,12 +457,29 @@ def current_customer_name() -> str:
     return customers.get(cid or "", {}).get("name", cid or "")
 
 
+def _fmt_duration(seconds: int) -> str:
+    """把秒数格式化成人读时长（小时/分钟），仅用于日志提示。"""
+    s = int(seconds)
+    if s % 3600 == 0:
+        return f"{s // 3600} 小时"
+    if s >= 3600:
+        return f"{s / 3600:.1f} 小时"
+    return f"{max(1, s // 60)} 分钟"
+
+
+def job_ttl_seconds(job: "Job") -> int:
+    """返回任务实际生效的保留时长：任务级 ttl_seconds>0 则用之，否则回退全局默认。"""
+    ttl = int(getattr(job, "ttl_seconds", 0) or 0)
+    return ttl if ttl > 0 else EXPORT_TTL_SECONDS
+
+
 def cleanup_expired_jobs() -> None:
     now = time.time()
     with JOBS_LOCK:
         for job_id in list(JOBS):
             job = JOBS[job_id]
-            expired = bool(job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS)
+            ttl = job_ttl_seconds(job)
+            expired = bool(job.finished_at and now - job.finished_at > ttl)
             for path_attr, event_name in (("export_path", "export.expired_deleted"), ("export_split_zip_path", "export_split.expired_deleted"), ("api_keys_path", "apikeys.expired_deleted"), ("mfa_secrets_path", "mfa.expired_deleted"), ("accounts_pw_path", "accounts_pw.expired_deleted"), ("log_path", "joblog.expired_deleted")):
                 path_value = getattr(job, path_attr, "")
                 if path_value and expired:
@@ -429,8 +491,8 @@ def cleanup_expired_jobs() -> None:
                     setattr(job, path_attr, "")
             if expired and job.status != "expired" and not job.export_path and not job.export_split_zip_path and not job.api_keys_path and not job.mfa_secrets_path and not job.accounts_pw_path and not job.log_path:
                 job.status = "expired"
-                job.log("导出文件已超过 60 分钟，已自动删除")
-            if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
+                job.log(f"导出文件已超过保留时长（{_fmt_duration(ttl)}），已自动删除")
+            if job.finished_at and now - job.finished_at > ttl * 2:
                 JOBS.pop(job_id, None)
                 audit("job.evicted", jobId=job.id, customerId=job.customer_id)
     _sweep_orphan_exports(now)
@@ -441,7 +503,8 @@ def _sweep_orphan_exports(now: float) -> None:
     """目录级兵底：所有导出文件都是 TTL 后即焚的临时产物。
     回收那些未被 job 属性跟踪（如 early changed-passwords / mfa-secrets-early）
     或 job 被逐出内存后残留的文件（含明文密码/MFA 密钥，属隐私敏感）。
-    按 mtime 超 TTL 删除；运行中任务文件 mtime 为近期，不会误删。"""
+    按 mtime 超 TTL 删除；运行中任务文件 mtime 为近期，不会误删。
+    注：用 MAX_EXPORT_TTL_SECONDS 作孤儿清理上限，避免误删自定义了较长保留时长的任务文件。"""
     try:
         base = EXPORT_DIR if 'EXPORT_DIR' in globals() else (Path(__file__).parent / "exports")
         if not base.exists():
@@ -451,7 +514,7 @@ def _sweep_orphan_exports(now: float) -> None:
             try:
                 if not path.is_file():
                     continue
-                if now - path.stat().st_mtime > EXPORT_TTL_SECONDS:
+                if now - path.stat().st_mtime > MAX_EXPORT_TTL_SECONDS:
                     path.unlink(missing_ok=True)
                     removed += 1
             except Exception:
@@ -530,7 +593,7 @@ def save_job_history(force: bool = True) -> None:
             jobs = sorted(JOBS.values(), key=lambda item: item.created_at, reverse=True)[:HISTORY_LIMIT]
             data = []
             for job in jobs:
-                if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
+                if job.finished_at and now - job.finished_at > job_ttl_seconds(job) * 2:
                     continue
                 data.append({
                     "id": job.id,
@@ -550,6 +613,7 @@ def save_job_history(force: bool = True) -> None:
                     "total": job.total,
                     "threads": job.threads,
                     "kind": job.kind,
+                    "ttl_seconds": job.ttl_seconds,
                     "usesBrowser": job.uses_browser,
                     "done": job.done,
                     "ok": job.ok,
@@ -582,7 +646,8 @@ def restore_job_history() -> None:
         with JOBS_LOCK:
             for item in data:
                 finished_at = item.get("finished_at")
-                if finished_at and now - float(finished_at) > EXPORT_TTL_SECONDS * 2:
+                item_ttl = int(item.get("ttl_seconds") or 0) or EXPORT_TTL_SECONDS
+                if finished_at and now - float(finished_at) > item_ttl * 2:
                     continue
                 status = item.get("status") or "failed"
                 if status in {"queued", "running"}:
@@ -604,6 +669,7 @@ def restore_job_history() -> None:
                     total=int(item.get("total") or 0),
                     threads=int(item.get("threads") or 1),
                     kind=item.get("kind") or "login",
+                    ttl_seconds=int(item.get("ttl_seconds") or 0),
                     uses_browser=bool(item.get("usesBrowser", True)),
                     done=int(item.get("done") or 0),
                     ok=int(item.get("ok") or 0),
@@ -691,7 +757,7 @@ def restore_jobs_from_exports() -> None:
                                 break
                     except Exception:
                         pass
-                if job.finished_at and now - job.finished_at > EXPORT_TTL_SECONDS * 2:
+                if job.finished_at and now - job.finished_at > job_ttl_seconds(job) * 2:
                     continue
     save_job_history()
 
@@ -795,6 +861,7 @@ class Job:
     total: int = 0
     threads: int = 1
     kind: str = "login"
+    ttl_seconds: int = 0  # 0 = 用全局默认 EXPORT_TTL_SECONDS；>0 = 本任务自定义保留时长
     uses_browser: bool = True
     done: int = 0
     ok: int = 0
@@ -2176,7 +2243,7 @@ def customer_history(customer_id: str) -> list[dict[str, Any]]:
                 "total": job.total,
                 "createdAt": int(job.created_at),
                 "finishedAt": int(job.finished_at or 0),
-                "expiresIn": None if not job.finished_at else max(0, int(EXPORT_TTL_SECONDS - (time.time() - age_base))),
+                "expiresIn": None if not job.finished_at else max(0, int(job_ttl_seconds(job) - (time.time() - age_base))),
                 "downloadReady": bool(job.export_path and Path(job.export_path).exists()),
                 "splitDownloadReady": bool(job.export_path and Path(job.export_path).exists()),
                 "apiKeysDownloadReady": bool(job.api_keys_path and Path(job.api_keys_path).exists() and Path(job.api_keys_path).stat().st_size > 0),
@@ -2340,6 +2407,9 @@ def index():
         default_new_password=DEFAULT_NEW_PASSWORD,
         customer_name=current_customer_name(),
         export_ttl_seconds=EXPORT_TTL_SECONDS,
+        default_retention_minutes=EXPORT_TTL_SECONDS // 60,
+        min_retention_minutes=MIN_EXPORT_TTL_SECONDS // 60,
+        max_retention_minutes=MAX_EXPORT_TTL_SECONDS // 60,
     )
 
 
@@ -2391,6 +2461,10 @@ def create_job():
     job_id = secrets.token_hex(8)
     threads = max(1, min(clamp_int(payload.get("threads"), 10, 1, MAX_THREADS_PER_JOB), len(accounts)))
     job = Job(id=job_id, customer_id=customer_id, total=len(accounts), threads=threads, kind="login", uses_browser=True)
+    # 账号数据保留时长（分钟）：默认全局 24h；前端可自定义，限定 [5分钟, 7天]。
+    _default_ttl_min = EXPORT_TTL_SECONDS // 60
+    _ttl_min = clamp_int(payload.get("retentionMinutes"), _default_ttl_min, MIN_EXPORT_TTL_SECONDS // 60, MAX_EXPORT_TTL_SECONDS // 60)
+    job.ttl_seconds = _ttl_min * 60
     login_timeout = clamp_int(payload.get("loginTimeout"), 180, 60, 600)
     password_mode = "fixed" if payload.get("passwordMode") == "fixed" else "random"
     fixed_new_password = payload.get("newPassword") or DEFAULT_NEW_PASSWORD
@@ -2422,7 +2496,7 @@ def create_job():
         job.options = options
         enqueue_job_locked(job)
     save_job_history()
-    audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], knownMfa=enriched_mfa, proxyPool=len(proxy_pool), proxyAssigned=proxy_assigned, ip=client_ip())
+    audit("job.created", jobId=job_id, customerId=customer_id, total=len(accounts), threads=threads, loginTimeout=login_timeout, headless=options["headless"], oidcRegion=options["oidc_region"], kiroRegion=options["kiro_region"], createApiKeys=options["create_api_keys"], apiKeyOnly=options["api_key_only"], strictProbe=options["strict_probe"], knownMfa=enriched_mfa, proxyPool=len(proxy_pool), proxyAssigned=proxy_assigned, ttlSeconds=job.ttl_seconds, ip=client_ip())
     if proxy_pool:
         job.log(f"代理池：{len(proxy_pool)} 个代理，已轮流分配给 {proxy_assigned} 个账号")
     if default_proxy_assigned:
@@ -2557,6 +2631,7 @@ def retry_job(job_id: str):
     options["threads"] = threads
     new_id = secrets.token_hex(8)
     job = Job(id=new_id, customer_id=customer_id, total=len(accounts), threads=threads, kind="login", uses_browser=True)
+    job.ttl_seconds = int(getattr(src, "ttl_seconds", 0) or 0)  # 重试任务继承原任务的保留时长
     with JOBS_LOCK:
         ok_enqueue, enqueue_error = can_enqueue_locked(customer_id, threads, True)
         if not ok_enqueue:

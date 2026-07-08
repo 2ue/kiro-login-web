@@ -62,7 +62,7 @@
     <div>
       <span class="eyebrow">Kiro Login Tool · 高速批量登录</span>
       <h1>Kiro 登录工具</h1>
-      <p class="subtitle">粘贴账号、填写 IDC Start URL，一键登录、检查可用性并导出 JSON 或 API Key。前台只显示关键状态，完整日志/文件保留 60 分钟。</p>
+      <p class="subtitle">粘贴账号、填写 IDC Start URL，一键登录、检查可用性并导出 JSON 或 API Key。前台只显示关键状态，完整日志/文件默认保留 {{ export_ttl_seconds // 60 }} 分钟（可在“更多配置”里自定义）。</p>
     </div>
     <form class="session" method="post" action="/logout">
       <a class="pill repo-pill" href="https://github.com/TWLW9784/kiro-login-web" target="_blank" rel="noopener" title="开源项目·点击查看源码"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>开源 GitHub</span></a>
@@ -75,7 +75,7 @@
     <section class="card">
       <div class="card-head">
         <div><h2 class="card-title">账号导入</h2><p class="card-desc">先粘贴账号和 Start URL，再在下方确认运行配置。</p></div>
-        <span class="pill">保留 {{ export_ttl_seconds // 60 }} 分钟</span>
+        <span class="pill">默认保留 {{ export_ttl_seconds // 60 }} 分钟</span>
       </div>
       <div class="card-body stack">
         <div class="form-section step-card">
@@ -109,6 +109,7 @@
               <div class="grid2 compact-fields" style="margin-top:10px">
                 <div><label>并行登录数</label><select id="threads"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option>10</option></select><div class="hint">默认 2；机房代理下并发越高越容易撞 captcha。挂住宅/移动代理可适当调高。</div></div>
                 <div><label>单账号超时</label><input id="loginTimeout" type="number" min="60" max="600" step="10" value="180"></div>
+                <div><label>账号数据保留时长（分钟）</label><input id="retentionMinutes" type="number" min="{{ min_retention_minutes }}" max="{{ max_retention_minutes }}" step="5" value="{{ default_retention_minutes }}"><div class="hint">任务完成后，导出文件/日志保留多久后自动删除。默认 {{ default_retention_minutes }} 分钟（{{ default_retention_minutes // 60 }} 小时）；范围 {{ min_retention_minutes }} 分钟 ~ {{ max_retention_minutes // 1440 }} 天。含明文密码/MFA，请及时下载。</div></div>
               </div>
               <div style="margin-top:10px">
                 <label>代理池（每行一个，轮流分配）</label>
@@ -205,7 +206,7 @@
   <section class="wide-panels">
     <details class="data-panel" open>
       <summary>
-        <span class="summary-main"><span class="summary-icon">🕘</span><span class="summary-text"><span class="summary-title">历史批次</span><span class="summary-desc">每条记录对应一次任务；下载文件保留 60 分钟，支持查看、下载和删除。</span></span></span>
+        <span class="summary-main"><span class="summary-icon">🕘</span><span class="summary-text"><span class="summary-title">历史批次</span><span class="summary-desc">每条记录对应一次任务；下载文件按任务设定的保留时长自动清理，支持查看、下载和删除。</span></span></span>
         <span class="summary-action"><span>点击收起</span></span>
       </summary>
       <div class="panel-body">
@@ -236,7 +237,7 @@ function startUrlValue(){return ($('startUrl')&&$('startUrl').value.trim())||'';
 function maybeFillStartUrlFromAccounts(){const input=$('startUrl'),text=$('accounts').value||'';if(!input||input.value.trim())return;const m=text.match(/Default AWS access portal URL \(IPv4 only\):\s*(https?:\/\/\S+)/i)||text.match(/Dual-stack AWS access portal URL:\s*(https?:\/\/\S+)/i);if(m)input.value=m[1].trim();}
 function estimateAccounts(){const text=($('accounts')&&$('accounts').value)||'',mode=($('accountMode')&&$('accountMode').value)||'auto';const lines=text.split(/\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'));let count=0,mfa=0;if(mode==='fixed'){lines.forEach(l=>{const parts=l.split(/\s+/).filter(Boolean);if(parts.length>=2&& !/^(email|username|user|account|账号)$/i.test(parts[0])){count++;if(parts[2]&&/^[A-Z2-7\s-]{16,}$/i.test(parts[2]))mfa++;}})}else{let pending=false;lines.forEach(l=>{if(/Default AWS access portal URL|Dual-stack AWS access portal URL/i.test(l))return;if(/^Username\s*:/i.test(l)||/^login\s*=|^\S+\s+\/\s+.+/i.test(l)||/^[^:\s|]+@?[^:\s|]*[:|,;\t].+/.test(l)||/^\s*(user(name)?|account|email)\s*[:：=].+pass(word)?\s*[:：=]/i.test(l)){count++;pending=true}else if(pending&&/^(2fa|mfa|totp)\S*\s*[:=]?\s*[A-Z2-7\s-]{16,}$/i.test(l)){mfa++;pending=false}else if(/^[A-Z2-7\s-]{16,}$/i.test(l)&&pending){mfa++;pending=false}})}const url=startUrlValue()||((text.match(/Default AWS access portal URL \(IPv4 only\):\s*(https?:\/\/\S+)/i)||text.match(/Dual-stack AWS access portal URL:\s*(https?:\/\/\S+)/i)||[])[1]||'');return{count,mfa,url,mode}}
 function updateParsePreview(){const p=estimateAccounts();if($('pvAccounts'))$('pvAccounts').textContent=p.count;if($('pvMfa'))$('pvMfa').textContent=p.mfa;if($('pvUrl'))$('pvUrl').textContent=p.url?'已识别':'未识别';if($('pvMode'))$('pvMode').textContent=p.mode==='fixed'?'固定':'自动';const ub=$('pvUrlBox');if(ub){ub.classList.toggle('ok',!!p.url);ub.classList.toggle('warn',!p.url)}const mb=$('pvModeBox');if(mb){mb.classList.toggle('ok',p.count>0)}}
-function payload(){const createApiKeys=$('createApiKeys').checked,apiKeyOnly=$('apiKeyOnly').checked;const loginMode=($('loginMode')&&$('loginMode').value)||'idc';return{accounts:$('accounts').value,accountMode:($('accountMode')&&$('accountMode').value)||'auto',loginMode,startUrl:startUrlValue(),newPassword:$('newPassword').value,passwordMode:$('passwordMode').value,oidcRegion:$('oidcRegion').value,kiroRegion:$('kiroRegion').value,createApiKeys,apiKeyOnly,strictProbe:$('strictProbe').checked,normalizeSymbols:$('normalizeSymbols')?$('normalizeSymbols').checked:true,apiKeyLabel:$('apiKeyLabel').value,threads:Number($('threads').value||10),loginTimeout:Number($('loginTimeout').value||180),proxyPool:($('proxyPool')&&$('proxyPool').value)||'',saveProxyPool:($('saveProxyPool')&&$('saveProxyPool').checked)||false,splitAccountsPerFile:Number(($('splitAccountsPerFile')&&$('splitAccountsPerFile').value)||1)}}
+function payload(){const createApiKeys=$('createApiKeys').checked,apiKeyOnly=$('apiKeyOnly').checked;const loginMode=($('loginMode')&&$('loginMode').value)||'idc';return{accounts:$('accounts').value,accountMode:($('accountMode')&&$('accountMode').value)||'auto',loginMode,startUrl:startUrlValue(),newPassword:$('newPassword').value,passwordMode:$('passwordMode').value,oidcRegion:$('oidcRegion').value,kiroRegion:$('kiroRegion').value,createApiKeys,apiKeyOnly,strictProbe:$('strictProbe').checked,normalizeSymbols:$('normalizeSymbols')?$('normalizeSymbols').checked:true,apiKeyLabel:$('apiKeyLabel').value,threads:Number($('threads').value||10),loginTimeout:Number($('loginTimeout').value||180),retentionMinutes:Number(($('retentionMinutes')&&$('retentionMinutes').value)||{{ default_retention_minutes }}),proxyPool:($('proxyPool')&&$('proxyPool').value)||'',saveProxyPool:($('saveProxyPool')&&$('saveProxyPool').checked)||false,splitAccountsPerFile:Number(($('splitAccountsPerFile')&&$('splitAccountsPerFile').value)||1)}}
 function setBusy(b){$('start').disabled=b;$('start').textContent=b?'运行中...':'开始登录';const sb=$('stopJob');if(sb)sb.style.display=b?'inline-flex':'none';const rb=$('retryJob');if(b&&rb)rb.style.display='none';}
 let pendingSplitJobId=null;
 function openSplitModal(jobId){pendingSplitJobId=jobId;const modal=$('splitModal'),input=$('splitModalInput'),err=$('splitModalError');const fallback=($('splitAccountsPerFile')&&$('splitAccountsPerFile').value)||'1';if(input){input.value=fallback;setTimeout(()=>{input.focus();input.select()},30)}if(err)err.style.display='none';if(modal){modal.classList.add('show');modal.setAttribute('aria-hidden','false')}}
