@@ -118,7 +118,7 @@ LOG_DIR.chmod(0o700)
 APP_LOG_PATH = LOG_DIR / "app.log"
 EXPORT_TTL_SECONDS = 24 * 3600  # 默认账号数据保留时长（默认 24 小时；可被任务级自定义覆盖）
 MIN_EXPORT_TTL_SECONDS = 5 * 60  # 自定义保留时长下限：5 分钟
-MAX_EXPORT_TTL_SECONDS = 7 * 24 * 3600  # 自定义保留时长上限：7 天（也是孤儿清理的兜底上限）
+MAX_EXPORT_TTL_SECONDS = 7 * 24 * 3600  # 自定义保留时长上限：7 天
 CLEANUP_INTERVAL_SECONDS = 30
 MAX_ACCOUNTS_PER_JOB = 50
 MAX_ACTIVE_JOBS_PER_CUSTOMER = 2
@@ -279,8 +279,10 @@ def migrate_customer_password_hash(customer_id: str, password: str) -> None:
         item["passwordHash"] = secure_password_hash(password)
         item.pop("password", None)
         changed = True
-    if not item.get("lookupHash"):
-        item["lookupHash"] = compute_lookup_hash(password)
+    # lookupHash 缺失或陈旧（Flask secret 旋转后旧 hash 不再匹配）都重写，保证下次走快路径。
+    expected_lookup = compute_lookup_hash(password)
+    if item.get("lookupHash") != expected_lookup:
+        item["lookupHash"] = expected_lookup
         changed = True
     if changed:
         save_customers_raw(raw)
@@ -437,10 +439,13 @@ def customer_for_password(password: str) -> dict[str, str] | None:
             if verify_password(password, customer["passwordHash"]):
                 migrate_customer_password_hash(customer["id"], password)
                 return customer
-    # 慢路径：对无 lookupHash 的客户全扫（首次迁移 / 密钥旋转后自愈）
+    # 慢路径：扫描“快路径未命中”的客户。包括无 lookupHash（首次迁移）
+    # 与 lookupHash 陈旧者（Flask secret 旋转后旧 hash 不再匹配 target）。
+    # 成功后 migrate 会用当前 secret 重写 lookupHash，下次进快路径（自愈）。
     for customer in customers.values():
-        if customer.get("lookupHash"):
-            continue
+        lh = customer.get("lookupHash")
+        if lh and hmac.compare_digest(lh, target):
+            continue  # 已在快路径验证过，不重复
         if verify_password(password, customer["passwordHash"]):
             migrate_customer_password_hash(customer["id"], password)
             return customer
@@ -500,21 +505,30 @@ def cleanup_expired_jobs() -> None:
 
 
 def _sweep_orphan_exports(now: float) -> None:
-    """目录级兵底：所有导出文件都是 TTL 后即焚的临时产物。
+    """目录级兜底：所有导出文件都是 TTL 后即焚的临时产物。
     回收那些未被 job 属性跟踪（如 early changed-passwords / mfa-secrets-early）
     或 job 被逐出内存后残留的文件（含明文密码/MFA 密钥，属隐私敏感）。
     按 mtime 超 TTL 删除；运行中任务文件 mtime 为近期，不会误删。
-    注：用 MAX_EXPORT_TTL_SECONDS 作孤儿清理上限，避免误删自定义了较长保留时长的任务文件。"""
+    每个文件按其归属 job 的实际保留时长判定（文件名尾部含 16 位 job_id）：
+    - job 仍在内存 → 用该 job 的 ttl（尊重自定义长保留，不误删）。
+    - job 已被逐出/无法解析 → 回退全局默认 EXPORT_TTL_SECONDS（避免明文密码/MFA 孤儿长期滞留）。"""
     try:
         base = EXPORT_DIR if 'EXPORT_DIR' in globals() else (Path(__file__).parent / "exports")
         if not base.exists():
             return
+        # 预取内存中各 job 的 ttl，避免在锁外反复取锁。
+        with JOBS_LOCK:
+            job_ttls = {jid: job_ttl_seconds(job) for jid, job in JOBS.items()}
         removed = 0
         for path in base.glob("*/kiro-*"):
             try:
                 if not path.is_file():
                     continue
-                if now - path.stat().st_mtime > MAX_EXPORT_TTL_SECONDS:
+                m = re.search(r"-([0-9a-f]{16})\.[^.]+$", path.name)
+                ttl = job_ttls.get(m.group(1)) if m else None
+                if ttl is None:
+                    ttl = EXPORT_TTL_SECONDS
+                if now - path.stat().st_mtime > ttl:
                     path.unlink(missing_ok=True)
                     removed += 1
             except Exception:

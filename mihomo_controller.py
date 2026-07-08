@@ -139,7 +139,7 @@ def pick_and_switch(group: str = GROUP, exclude: str = "", log=None) -> tuple[st
                 if log:
                     log(f"已切换出口节点 → {node}（延迟 {d}ms，出口IP {new_ip}，换 IP 规避风控）")
                 return node, d
-            # 节点通但出口 IP 没变（共用同一 VPS），先记为兵底，继续找不同 IP
+            # 节点通但出口 IP 没变（共用同一 VPS），先记为兜底，继续找不同 IP
             if fallback is None:
                 fallback = (node, d)
         # 没找到不同 IP 的，退而用一个“通但同 IP”的节点（总比死节点强）
