@@ -333,6 +333,28 @@ def update_customer_name(customer_id: str, name: str) -> str:
     return new_name
 
 
+def load_customer_proxy_pool(customer_id: str) -> str:
+    """读取客户已保存的代理池文本（持久化在 customers.json）。不存在返回空串。"""
+    if not customer_id:
+        return ""
+    raw = read_customers_raw()
+    val = (raw.get(customer_id) or {}).get("proxyPool", "")
+    return val if isinstance(val, str) else ""
+
+
+def save_customer_proxy_pool(customer_id: str, text: str) -> int:
+    """保存客户代理池（每行一个）。只存合法代理，去重；返回保存的代理数量。
+    存前先用 parse_proxy_pool 校验/规范化，避免存入非法或重复项。"""
+    pool = parse_proxy_pool(text or "")
+    normalized = "\n".join(pool)
+    with CUSTOMERS_LOCK:
+        raw = read_customers_raw()
+        if customer_id in raw:
+            raw[customer_id]["proxyPool"] = normalized
+            save_customers_raw(raw)
+    return len(pool)
+
+
 def valid_custom_password(password: str) -> tuple[bool, str]:
     if len(password) < 8:
         return False, "密码至少 8 位"
@@ -1798,21 +1820,29 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     if outcome.changed_password:
         _save_password_early(new_password)
 
-    # 风控规避：撞 captcha / 代理连接失败 → 立即换出口 IP(切 mihomo 节点) + 重新取登录URL + 重试。
+    # 风控规避：撞 captcha / 代理连接失败 → 换出口 IP + 重新取登录URL + 重试。
+    # 换 IP 两种方式（按优先级）：
+    #   1) 本地部署配了 mihomo 控制器 → 切节点换出口 IP（pick_and_switch）；
+    #   2) 开源通用：未配 mihomo 但提交了代理池 → 在池内轮换下一个代理（换 IP）。
     # 效率第一：不再做 30~90s 随机等待，也不做代理错误指数退避；失败后直接换 IP 快速推进。
     rc_max = int(options.get("risk_retry", 3) or 3)
     rc_attempt = 0
+    # 代理池轮换游标（仅无 mihomo 时使用）：从当前代理的下一个开始，避开重复。
+    _pool = [p for p in (options.get("proxy_pool") or []) if p]
+    _pool_i = 0
     while (not outcome.ok and rc_attempt < rc_max
            and not (job.stop_event and job.stop_event.is_set())
            and (is_captcha_error(outcome.error) or is_proxy_conn_error(outcome.error))):
         rc_attempt += 1
         reason = "验证码/风控" if is_captcha_error(outcome.error) else "代理连接异常"
-        log(f"{reason}，立即换 IP 重试（第 {rc_attempt}/{rc_max} 次）")
         if job.stop_event and job.stop_event.is_set():
             break
-        # 换出口 IP(需配了 mihomo 控制器)；pick_and_switch 会确保出口 IP 真的变了
+        switched = False
+        # 方式 1：mihomo 切节点换出口 IP
         if mihomo.enabled():
+            log(f"{reason}，立即换出口 IP 重试（第 {rc_attempt}/{rc_max} 次）")
             mihomo.pick_and_switch(exclude=mihomo.current_node(), log=log)
+            switched = True
             # 撞 captcha 后短暂冷却，避免同一出口连续高频请求被风控叠加
             if is_captcha_error(outcome.error):
                 cd = random.uniform(3.0, 7.0)
@@ -1820,6 +1850,37 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
                 while slept < cd and not (job.stop_event and job.stop_event.is_set()):
                     time.sleep(min(1.0, cd - slept))
                     slept += 1.0
+        # 方式 2（开源通用）：无 mihomo 但有代理池 → 轮换下一个代理
+        elif _pool:
+            # 从池里选一个与当前不同的代理
+            picked = ""
+            for _ in range(len(_pool)):
+                cand = _pool[_pool_i % len(_pool)]
+                _pool_i += 1
+                if cand != acc.proxy:
+                    picked = cand
+                    break
+            if picked:
+                acc.proxy = picked
+                switched = True
+                # 代理不回显完整串（可能含账密），只显 host
+                _host = picked.split("://", 1)[-1].split("@")[-1].split("/", 1)[0]
+                log(f"{reason}，已轮换代理池下一个代理→ {_host}（第 {rc_attempt}/{rc_max} 次）")
+                if is_captcha_error(outcome.error):
+                    cd = random.uniform(3.0, 7.0)
+                    slept = 0.0
+                    while slept < cd and not (job.stop_event and job.stop_event.is_set()):
+                        time.sleep(min(1.0, cd - slept))
+                        slept += 1.0
+            else:
+                log(f"{reason}，代理池无其他可用代理可换，停止重试（第 {rc_attempt}/{rc_max} 次）")
+                break
+        else:
+            # 既无 mihomo 也无代理池：换不了 IP，重试只会撞同样的风控，直接停。
+            log(f"{reason}，未配置换 IP 能力（无 mihomo 控制器且未提交代理池），无法解 captcha，停止重试")
+            break
+        if not switched:
+            break
         # 重新获取登录 URL(旧 device code 已失效)
         start_rc = dca.register_and_start(
             oidc_region=options["oidc_region"],
@@ -2313,8 +2374,18 @@ def create_job():
     if create_api_keys and api_key_only:
         return jsonify({"error": "同步创建 API Key 和仅创建 API Key 不能同时开启"}), 400
     # 代理池：粘贴一批代理，轮流分配给未单独指定代理的账号（不同 IP 是解 captcha 最有效的办法）。
-    proxy_pool = parse_proxy_pool(payload.get("proxyPool", ""))
+    # 优先用本次提交的；若本次未提交，回退到客户已保存的代理池（持久化）。
+    _pool_text = payload.get("proxyPool", "")
+    if not (_pool_text or "").strip():
+        _pool_text = load_customer_proxy_pool(customer_id)
+    proxy_pool = parse_proxy_pool(_pool_text)
     proxy_assigned = apply_proxy_pool(accounts, proxy_pool) if proxy_pool else 0
+    # 若前端勾选了“保存代理池”且本次有文本，则持久化到客户配置。
+    if bool(payload.get("saveProxyPool", False)) and (payload.get("proxyPool", "") or "").strip():
+        try:
+            save_customer_proxy_pool(customer_id, payload.get("proxyPool", ""))
+        except Exception as exc:
+            logger.warning("save_proxy_pool_failed customer=%s err=%s", customer_id, exc)
     # 兑底：仍无代理的账号套服务端默认代理（env KIRO_DEFAULT_PROXY，允许本机回环）。
     default_proxy, default_proxy_assigned = apply_default_proxy(accounts)
     job_id = secrets.token_hex(8)
@@ -2340,6 +2411,8 @@ def create_job():
         "api_key_label": (payload.get("apiKeyLabel") or "1").strip()[:80] or "1",
         "strict_probe": bool(payload.get("strictProbe", False)),
         "split_accounts_per_file": clamp_int(payload.get("splitAccountsPerFile"), 1, 1, 1000),
+        # 代理池传给执行层：无 mihomo 控制器时，撞 captcha/代理报错可在池内轮换代理重试（开源通用）。
+        "proxy_pool": proxy_pool,
     }
     with JOBS_LOCK:
         ok_enqueue, enqueue_error = can_enqueue_locked(customer_id, threads, True)
@@ -2409,6 +2482,32 @@ def get_history():
     if not customer_id:
         return jsonify({"error": "请先输入客户密码"}), 401
     return jsonify({"items": customer_history(customer_id)})
+
+
+@app.get("/api/proxy-pool")
+def get_proxy_pool():
+    """读回当前客户已保存的代理池（用于页面加载时回填）。"""
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    text = load_customer_proxy_pool(customer_id)
+    return jsonify({"proxyPool": text, "count": len(parse_proxy_pool(text))})
+
+
+@app.post("/api/proxy-pool")
+def save_proxy_pool():
+    """保存/更新当前客户的代理池（每行一个，自动去重/校验）。"""
+    customer_id = current_customer_id()
+    if not customer_id:
+        return jsonify({"error": "请先输入客户密码"}), 401
+    payload = request.get_json(force=True, silent=True) or {}
+    text = payload.get("proxyPool", "")
+    if not isinstance(text, str):
+        return jsonify({"error": "proxyPool 必须为文本"}), 400
+    if len(text) > 200_000:
+        return jsonify({"error": "代理池文本过大"}), 400
+    count = save_customer_proxy_pool(customer_id, text)
+    return jsonify({"ok": True, "count": count})
 
 
 @app.post("/api/jobs/<job_id>/stop")
