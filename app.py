@@ -419,8 +419,10 @@ def validate_start_url(value: str) -> tuple[bool, str]:
     if not (is_awsapps or is_portal):
         return False, "IDC Start URL 域名应为 *.awsapps.com 或 *.portal.<region>.app.aws"
     path = parsed.path.rstrip("/")
-    if is_awsapps and path and not path.endswith("/start"):
-        return False, "*.awsapps.com 域名通常应以 /start 结尾"
+    if is_awsapps and not path.endswith("/start"):
+        # *.awsapps.com 必须以 /start 结尾。根路径或截断的 URL（如 .../ 少了 start）
+        # 自动补 /start，避免用户在表单里少填 start 导致 AWS 报 Invalid start url。
+        return True, f"https://{host}/start"
     return True, url
 
 
