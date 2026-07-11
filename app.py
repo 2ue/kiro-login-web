@@ -1191,6 +1191,173 @@ def _parse_starturl_header_blocks(text: str) -> list[AccountInput]:
     return accounts if saw_header else []
 
 
+# 中文/英文标签 → 内部字段名。用于「标签多行块」格式。
+LABELED_FIELD_ALIASES = {
+    "start_url": ("登录地址", "登陆地址", "地址", "start url", "starturl", "start_url", "url", "portal", "门户"),
+    "email": ("用户名", "账号", "账号名", "邮箱", "username", "user", "email", "account", "login"),
+    "password": ("密码", "password", "pass", "pwd"),
+    "region": ("区域", "地区", "region", "区"),
+    "mfa_secret": ("mfa", "2fa", "totp", "密钥", "mfa密钥", "验证器密钥"),
+}
+# 标签行正则：行首为中/英文标签 + 冒号（半/全角）+ 值。
+_LABELED_LINE_RE = re.compile(r"^\s*([A-Za-z\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff ]*?)\s*[:\uff1a]\s*(.+?)\s*$")
+
+# 单行内联标签定位正则：匹配「(行首或空白)标签:」，用于把一整行按标签切成多段。
+# 别名按长度降序，长别名优先（如 登录地址 先于 地址、mfa密钥 先于 mfa）。
+_INLINE_LABEL_ALTERNATION = "|".join(
+    re.escape(a) for a in sorted(
+        (alias for aliases in LABELED_FIELD_ALIASES.values() for alias in aliases),
+        key=len, reverse=True,
+    )
+)
+_INLINE_LABEL_RE = re.compile(
+    r"(?:^|\s)(" + _INLINE_LABEL_ALTERNATION + r")\s*[:\uff1a]",
+    re.IGNORECASE,
+)
+
+
+def _resolve_labeled_field(label: str) -> str:
+    low = label.strip().lower()
+    for field_name, aliases in LABELED_FIELD_ALIASES.items():
+        for alias in aliases:
+            if low == alias.lower():
+                return field_name
+    # 包含式兵底（如「登录地址 URL」），优先长别名
+    for field_name, aliases in LABELED_FIELD_ALIASES.items():
+        for alias in aliases:
+            if alias.lower() in low:
+                return field_name
+    return ""
+
+
+def _parse_labeled_block_accounts(text: str) -> list[AccountInput]:
+    """解析「中文标签多行块」格式（每字段占一行，标签:值）：
+
+      登录地址: https://d-9066779967.awsapps.com/start
+      用户名: ulzqehr0m
+      密码: dVCT/4F.6IRhX<&1WmfIj/
+      区域: us-east-1
+
+    支持：
+    - 中文或英文标签（登录地址/用户名/密码/区域，MFA 可选）。
+    - 冒号半角/全角均可。值从首个冒号右切（密码含冒号/特殊符也安全）。
+    - 多个账号：用空行分隔，或遇到重复的必填字段（用户名/密码）自动开新块。
+    - 后续块未重填 start_url/region 时，继承上一块（方便多账号共用同一登录地址）。
+    需至少命中一个 start_url 标签才视为本格式（避免误判普通 email:password）。
+    """
+    accounts: list[AccountInput] = []
+    cur: dict[str, str] = {}
+    last_start_url = ""
+    last_region = ""
+    saw_start_url = False
+
+    def flush() -> None:
+        nonlocal cur, last_start_url, last_region
+        if not cur:
+            return
+        email = cur.get("email", "").strip()
+        password = cur.get("password", "").strip()
+        su = cur.get("start_url", "").strip() or last_start_url
+        rg = cur.get("region", "").strip() or last_region
+        if su:
+            last_start_url = su
+        if rg:
+            last_region = rg
+        if email and password:
+            accounts.append(AccountInput(
+                idx=len(accounts) + 1,
+                email=email,
+                password=password,
+                start_url=su,
+                region=rg,
+                mfa_secret=cur.get("mfa_secret", "").strip(),
+            ))
+        cur = {}
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            if not line:
+                flush()
+            continue
+        m = _LABELED_LINE_RE.match(line)
+        if not m:
+            continue
+        field_name = _resolve_labeled_field(m.group(1))
+        value = m.group(2).strip()
+        if not field_name or not value:
+            continue
+        # 遇到重复的必填字段（已有值）→ 认为新账号开始
+        if field_name in ("email", "password") and cur.get(field_name):
+            flush()
+        if field_name == "start_url":
+            saw_start_url = True
+        cur[field_name] = value
+    flush()
+    return accounts if saw_start_url else []
+
+
+def _parse_inline_labeled_line(line: str, idx: int, last_start_url: str, last_region: str) -> Optional[AccountInput]:
+    """解析单行内多标签格式（所有字段挤在一行）：
+
+      登录地址: https://d-9066779967.awsapps.com/start 用户名: ubka3dauv 密码: /Lb3gQl20u7w!KbbBy@&*so 区域: us-east-1
+
+    按标签位置切分，每个字段值 = 当前标签冒号后 到 下一标签前。
+    这样密码含空格/特殊符号也能正确切分（只要不碰到另一个标签词）。
+    未重填 start_url/region 时继承上一条。需同时命中用户名+密码才视为本格式。
+    """
+    matches = list(_INLINE_LABEL_RE.finditer(line))
+    if len(matches) < 2:
+        return None
+    fields: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        field_name = _resolve_labeled_field(m.group(1))
+        if not field_name:
+            continue
+        val_start = m.end()
+        val_end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+        value = line[val_start:val_end].strip()
+        # 同一字段多次命中时取首次（避免后面噪声覆盖）
+        if field_name not in fields and value:
+            fields[field_name] = value
+    email = fields.get("email", "").strip()
+    password = fields.get("password", "").strip()
+    if not email or not password:
+        return None
+    su = fields.get("start_url", "").strip() or last_start_url
+    rg = fields.get("region", "").strip() or last_region
+    return AccountInput(
+        idx=idx,
+        email=email,
+        password=password,
+        start_url=su,
+        region=rg,
+        mfa_secret=fields.get("mfa_secret", "").strip(),
+    )
+
+
+def _parse_inline_labeled_accounts(text: str) -> list[AccountInput]:
+    """多行，每行一个单行内联标签账号。start_url/region 可行间继承。
+    需至少一行命中 start_url 标签才视为本格式（避免误判普通 email:password）。"""
+    accounts: list[AccountInput] = []
+    last_start_url = ""
+    last_region = ""
+    saw_start_url = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        acc = _parse_inline_labeled_line(line, len(accounts) + 1, last_start_url, last_region)
+        if not acc:
+            continue
+        if acc.start_url:
+            last_start_url = acc.start_url
+            saw_start_url = True
+        if acc.region:
+            last_region = acc.region
+        accounts.append(acc)
+    return accounts if saw_start_url else []
+
 def parse_accounts(text: str, mode: str = "auto") -> list[AccountInput]:
     """解析账号输入。支持格式（分隔符可用空格/tab/逗号/分号/竖线/冒号）：
       email password                       # 最简
@@ -1211,6 +1378,16 @@ def parse_accounts(text: str, mode: str = "auto") -> list[AccountInput]:
     pipe_blocks = _parse_pipe_starturl_blocks(text)
     if pipe_blocks:
         return pipe_blocks
+
+    # 中文标签多行块（登录地址/用户名/密码/区域，每字段独占一行），标签识别性强、优先于表头块
+    labeled_blocks = _parse_labeled_block_accounts(text)
+    if labeled_blocks:
+        return labeled_blocks
+
+    # 中文标签单行内联格式（所有字段挤在一行：登录地址: xx 用户名: yy 密码: zz 区域: ww）
+    inline_labeled = _parse_inline_labeled_accounts(text)
+    if inline_labeled:
+        return inline_labeled
 
     # 次优先：表头块格式（单行 start_url + 单行 region + 多行 email|password）
     header_blocks = _parse_starturl_header_blocks(text)
@@ -1306,8 +1483,21 @@ def safe_export_filename(value: str, fallback: str) -> str:
 
 
 def random_account_password() -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-    core = "".join(secrets.choice(alphabet) for _ in range(18))
+    # AWS IDC 密码策略要求大写+小写+数字+符号四类齐全。
+    # 前缀 "Kiro@" 已含大写/小写/符号，末尾 "#" 为符号，但中间 core 必须保证至少一个数字，
+    # 否则纯随机可能抽到全字母（无数字）导致 Invalid password。
+    lower = "abcdefghijkmnopqrstuvwxyz"
+    upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    digits = "23456789"
+    alphabet = upper + lower + digits
+    core_chars = [
+        secrets.choice(lower),
+        secrets.choice(upper),
+        secrets.choice(digits),
+    ]
+    core_chars.extend(secrets.choice(alphabet) for _ in range(15))
+    secrets.SystemRandom().shuffle(core_chars)
+    core = "".join(core_chars)
     return f"Kiro@{core}#"
 
 
@@ -2131,9 +2321,10 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             _save_password_early(new_password)
 
     if (not outcome.ok
-            and outcome.changed_password
             and looks_like_password_policy_error(outcome.error)
             and not (job.stop_event and job.stop_event.is_set())):
+        # 策略错误时改密本就不会成功（changed_password 仍为 False），
+        # 所以重试不能依赖 changed_password，只要识别为策略错误就换更强密码重试一次。
         retry_password = stronger_account_password()
         log("首次改密密码策略不通过，自动生成更强新密码并重试一次")
         start_retry = dca.register_and_start(
@@ -2157,7 +2348,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             outcome = retry_outcome
     if not outcome.ok:
         log(f"浏览器登录失败：{outcome.error}")
-        return AccountResult(acc.idx, acc.email, False, outcome.error, outcome.changed_password)
+        return AccountResult(acc.idx, acc.email, False, outcome.error, outcome.changed_password, mfa_secret=outcome.mfa_secret or acc.mfa_secret)
 
     log("浏览器授权完成，开始换取 token")
     if outcome.mfa_secret:
@@ -2166,7 +2357,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
     exp = dca.poll_for_token(start, fetch_profile=False, log=log, stop_event=job.stop_event)
     if exp.error:
         log(f"换取 token 失败：{exp.error}")
-        return AccountResult(acc.idx, acc.email, False, exp.error, outcome.changed_password)
+        return AccountResult(acc.idx, acc.email, False, exp.error, outcome.changed_password, mfa_secret=outcome.mfa_secret or acc.mfa_secret)
     exp.email = acc.email
 
     log("token 获取成功，开始扫描 profileArn")
@@ -2179,6 +2370,7 @@ def run_one(job: Job, acc: AccountInput, options: dict[str, Any]) -> AccountResu
             False,
             "登录成功但未获取到 profileArn（已扫描首选区 + us-east-1/eu-central-1；若首选区域错误已自动回退）",
             outcome.changed_password,
+            mfa_secret=outcome.mfa_secret or acc.mfa_secret,
         )
 
     exported: list[dict[str, Any]] = []
@@ -2308,14 +2500,37 @@ def run_job(job: Job, accounts: list[AccountInput], options: dict[str, Any]) -> 
             api_keys_path.write_text("\n".join(api_keys_all) + "\n", encoding="utf-8")
             api_keys_path.chmod(0o600)
             job.api_keys_path = str(api_keys_path)
-        # 绑定了新 MFA 的账号：导出 email:secret 供下载保存
-        mfa_lines = [f"{r.email}:{r.mfa_secret}" for r in job.results if r.mfa_secret]
+        # 绑定了新 MFA 的账号：导出 email:secret 供下载保存。
+        # 优先取成功 result 的密钥；再合并 early 落盘文件——只要抠到过密钥，
+        # 即使账号后续（改密/换 token/扫 profile）失败也不丢，避免密钥变孤儿。
+        mfa_map: dict[str, str] = {}
+        for r in job.results:
+            if r.mfa_secret:
+                mfa_map[r.email] = r.mfa_secret
+        early_only = 0
+        early_mfa_path = out_dir / f"kiro-mfa-secrets-early-{job.id}.txt"
+        if early_mfa_path.exists():
+            try:
+                for line in early_mfa_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or ":" not in line:
+                        continue
+                    em, _, sec = line.partition(":")
+                    em = em.strip()
+                    sec = sec.strip()
+                    if em and sec and em not in mfa_map:
+                        mfa_map[em] = sec
+                        early_only += 1
+            except Exception as exc:
+                job.log(f"合并 early MFA 密钥失败：{exc}")
+        mfa_lines = [f"{em}:{sec}" for em, sec in mfa_map.items()]
         if mfa_lines:
             mfa_path = out_dir / f"kiro-mfa-secrets-{job.id}.txt"
             mfa_path.write_text("\n".join(mfa_lines) + "\n", encoding="utf-8")
             mfa_path.chmod(0o600)
             job.mfa_secrets_path = str(mfa_path)
-            job.log(f"本次新绑定 MFA 账号 {len(mfa_lines)} 个，密钥已导出（务必下载保存）")
+            extra = f"（含 {early_only} 个登录未完成但已抠到密钥的账号）" if early_only else ""
+            job.log(f"本次新绑定 MFA 账号 {len(mfa_lines)} 个，密钥已导出{extra}（务必下载保存）")
         # 一键提取账号密码：所有登录成功的账号 email:password（密码为改密后的最终密码）
         pw_lines = [f"{r.email}:{r.final_password}" for r in job.results if r.ok and r.email and r.final_password]
         if pw_lines:
