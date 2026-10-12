@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from playwright.sync_api import sync_playwright
 
 import mfa_totp
+from proxy_util import playwright_proxy
 
 
 def _tile_args(window_index: int, window_count: int):
@@ -30,6 +31,7 @@ def drive_m365_login(
     headless: bool = True,
     proxy: str = "",
     timeout_s: int = 300,
+    failure_wait_s: int = 60,
     stop_event=None,
     debug_dir: str = "",
     on_secret: Optional[Callable[[str], None]] = None,
@@ -60,7 +62,7 @@ def drive_m365_login(
     # 关键：OAuth 回调重定向到 http://localhost:<port>，必须让回环地址绕过代理，
     # 否则 Chromium（新版默认不 bypass localhost）会把回调请求也送进出口代理，
     # 请求到不了本机监听端口 → result_queue 收不到 code → wait_and_exchange 超时。
-    proxy_cfg = {"server": proxy, "bypass": "localhost, 127.0.0.1, ::1, [::1]"} if proxy else None
+    proxy_cfg = playwright_proxy(proxy, bypass="localhost, 127.0.0.1, ::1, [::1]")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, args=launch_args, proxy=proxy_cfg)
@@ -125,6 +127,7 @@ def drive_m365_login(
         deadline = time.time() + timeout_s
         last_url = ""
         idle = 0
+        post_password_idle_since = 0.0
         mfa_secret_norm = mfa_totp.normalize_secret(mfa_secret) if mfa_secret else ""
         mfa_attempts = 0
         pwd_done = False
@@ -153,6 +156,7 @@ def drive_m365_login(
                         _click_any(page, ['#idSIButton9', 'input[type=submit]',
                                           'button[type=submit]', 'button:has-text("Sign in")'])
                         pwd_done = True
+                        post_password_idle_since = 0.0
                         time.sleep(4.0)
                         shot("04_after_pwd")
                         continue
@@ -170,6 +174,7 @@ def drive_m365_login(
             if "stay signed in" in body or "保持登录" in body or "reduce the number of times" in body:
                 _click_any(page, ['#idSIButton9', 'button:has-text("Yes")',
                                   'input[type=submit][value="Yes"]'])
+                post_password_idle_since = 0.0
                 time.sleep(3.0)
                 shot("05_stay")
                 continue
@@ -191,6 +196,7 @@ def drive_m365_login(
                                               'input[type=submit]', 'button:has-text("Verify")',
                                               'button:has-text("Next")'])
                             log("已填入 MFA 验证码")
+                            post_password_idle_since = 0.0
                             time.sleep(4.0)
                             shot(f"06_mfa_{mfa_attempts}")
                             continue
@@ -207,6 +213,7 @@ def drive_m365_login(
                 if not _click_any(page, ['#idBtn_Back', 'a:has-text("Skip")',
                                          'button:has-text("Skip")', 'input[value="Skip setup"]']):
                     _click_any(page, ['#idSIButton9', 'input[type=submit]'])
+                post_password_idle_since = 0.0
                 time.sleep(3.0)
                 continue
 
@@ -215,7 +222,15 @@ def drive_m365_login(
                 idle += 1
             else:
                 idle = 0
+                post_password_idle_since = 0.0
             last_url = url
+            if pwd_done:
+                now = time.time()
+                if not post_password_idle_since:
+                    post_password_idle_since = now
+                elif now - post_password_idle_since >= max(1, int(failure_wait_s or 60)):
+                    browser.close()
+                    return False, "M365 密码提交后等待授权回调超过 %d 秒" % max(1, int(failure_wait_s or 60))
             if idle >= 1:
                 if not _click_any(page, ['#idSIButton9', 'button[type=submit]', 'input[type=submit]',
                                          'button:has-text("Next")', 'button:has-text("Continue")']):

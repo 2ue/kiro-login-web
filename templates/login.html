@@ -22,14 +22,14 @@
 <body>
   <form class="card" method="post" action="/login">
     <h1>Kiro 批量登录导出</h1>
-    <p>输入你的专属密码即可进入；如果这个密码第一次使用，系统会自动创建一个新的独立客户空间。已存在的密码可填写客户名称来更新右上角显示名。</p>
+    <p>输入已配置的客户密码即可进入；如果这个密码第一次使用，系统会自动创建一个新的独立客户空间。已存在的密码可填写客户名称来更新右上角显示名。</p>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
     <label for="customer_name">客户名称（选填，可更新显示名）</label>
     <input id="customer_name" name="customer_name" type="text" autocomplete="organization" placeholder="例如：客户A / 张三团队">
     <label for="password">专属密码</label>
     <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
     <button type="submit">进入 / 创建客户空间</button>
-    <div class="hint">密码至少 8 位，必须包含大写字母、小写字母和数字。请妥善保存：以后用同一个密码进入同一个客户空间。导出文件仅保留 60 分钟，过期自动删除。</div>
+    <div class="hint">首次自助创建新客户时，密码至少 8 位并且必须包含大写字母、小写字母和数字。已有客户密码按你在 `customers.json` 里配置的原样登录即可。导出文件仅保留 60 分钟，过期自动删除。</div>
   </form>
 </body>
 </html>

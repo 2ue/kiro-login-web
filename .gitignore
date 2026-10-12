@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.before-*
 debug_mfa/
+debug_social/
 mfa_test_run.py
 
 .flask-secret
@@ -10,7 +11,10 @@ customers.json
 data/
 exports/
 logs/
+batch_inputs/
+59137-proxy-nodes*.txt
 run.pid
+.kiro-login-web.pid
 
 .env
 .env.*

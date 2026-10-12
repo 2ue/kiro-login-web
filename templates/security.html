@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>改密 / 2FA · Kiro</title>
+  <style>
+    :root{
+      color-scheme:dark;
+      --bg:#070a11; --bg2:#0b1020; --panel:rgba(15,23,42,.82); --panel2:rgba(2,6,23,.72);
+      --line:rgba(148,163,184,.18); --line2:rgba(148,163,184,.32); --text:#eef2ff; --muted:#94a3b8;
+      --brand:#60a5fa; --brand2:#22c55e; --bad:#fb7185; --warn:#fbbf24; --ok:#86efac; --violet:#a78bfa;
+      --shadow:0 24px 70px rgba(0,0,0,.34); --radius:22px; --radius2:16px;
+    }
+    *{box-sizing:border-box} html{min-height:100%;background:var(--bg)}
+    body{margin:0;min-height:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 12% -12%,rgba(96,165,250,.30),transparent 32%),radial-gradient(circle at 86% 0%,rgba(34,197,94,.18),transparent 28%),radial-gradient(circle at 60% 105%,rgba(167,139,250,.14),transparent 30%),linear-gradient(180deg,#070a11,#0b1020 58%,#070a11)}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);background-size:44px 44px;mask-image:linear-gradient(to bottom,rgba(0,0,0,.78),transparent)}
+    main{max-width:1760px;margin:0 auto;padding:16px clamp(14px,1.8vw,30px) 22px;position:relative}
+    .topbar{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:14px;padding:14px 16px;border:1px solid rgba(148,163,184,.16);border-radius:24px;background:linear-gradient(135deg,rgba(15,23,42,.72),rgba(2,6,23,.42));box-shadow:0 18px 60px rgba(0,0,0,.22);backdrop-filter:blur(18px)}
+    .eyebrow{display:inline-flex;align-items:center;gap:8px;color:#bfdbfe;background:rgba(96,165,250,.12);border:1px solid rgba(96,165,250,.24);border-radius:999px;padding:5px 9px;font-size:11px;font-weight:800}
+    h1{margin:6px 0 3px;font-size:clamp(26px,3.6vw,42px);line-height:1;letter-spacing:-.045em}
+    .subtitle{display:block;max-width:760px;margin:0;color:var(--muted);font-size:12px;line-height:1.4}
+    .session{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+    .pill,.badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:rgba(15,23,42,.72);border-radius:999px;padding:7px 11px;color:#cbd5e1;font-size:12px;font-weight:750;white-space:nowrap}
+    .nav-current{border-color:rgba(96,165,250,.55)!important;background:rgba(96,165,250,.16)!important;color:#dbeafe!important}
+    .shell{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(460px,.92fr);gap:18px;align-items:start}
+    .card{background:linear-gradient(180deg,rgba(15,23,42,.90),rgba(2,6,23,.76));border:1px solid rgba(148,163,184,.20);border-radius:var(--radius);box-shadow:var(--shadow);backdrop-filter:blur(18px);overflow:hidden}
+    .card-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;padding:16px 18px 12px;border-bottom:1px solid var(--line)}
+    .card-title{margin:0;font-size:17px;letter-spacing:-.02em}.card-desc{display:block;margin:4px 0 0;color:var(--muted);font-size:11px;line-height:1.35}
+    .card-body{padding:14px 18px 16px}.stack{display:grid;gap:11px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    label{display:block;margin:0 0 6px;color:#dbeafe;font-size:11px;font-weight:850;letter-spacing:.03em;text-transform:uppercase}
+    textarea,input,select{width:100%;border:1px solid rgba(148,163,184,.25);background:rgba(2,6,23,.66);color:var(--text);border-radius:14px;padding:10px 12px;font-size:13px;outline:none;transition:border-color .18s,box-shadow .18s,background .18s}
+    textarea{min-height:150px;resize:vertical;font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,monospace;line-height:1.45}
+    textarea:focus,input:focus,select:focus{border-color:rgba(96,165,250,.78);box-shadow:0 0 0 4px rgba(96,165,250,.13);background:rgba(2,6,23,.92)}
+    .hint{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.35}.micro{color:#64748b;font-size:10px}
+    details.advanced{border:1px solid var(--line);border-radius:14px;background:rgba(2,6,23,.22);overflow:hidden}details.advanced>summary{cursor:pointer;list-style:none;padding:9px 11px;color:#cbd5e1;font-size:12px;font-weight:800;display:flex;justify-content:space-between;align-items:center}details.advanced>summary::-webkit-details-marker{display:none}details.advanced>summary:after{content:'展开';color:var(--muted);font-size:11px;font-weight:700}details.advanced[open]>summary:after{content:'收起'}details.advanced .advanced-body{padding:0 11px 11px;display:grid;gap:9px}
+    button,.button{border:0;border-radius:14px;padding:10px 15px;background:rgba(51,65,85,.86);color:white;font-weight:900;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:42px;transition:transform .15s,opacity .15s,background .15s}button:hover,.button:hover{transform:translateY(-1px)}button:disabled{opacity:.55;cursor:not-allowed;transform:none}.primary{background:linear-gradient(135deg,#3b82f6,#22c55e);box-shadow:0 12px 30px rgba(34,197,94,.20)}.secondary{background:rgba(30,41,59,.92)}
+    .run-cta{width:100%;min-height:52px;font-size:15px}.console-actions{display:flex;gap:9px;align-items:center;margin-bottom:12px}.console-actions .run-cta{flex:1}.danger{background:rgba(127,29,29,.72);color:#fecaca}.task-summary{display:none;margin:10px 0 0;padding:10px 12px;border:1px solid rgba(34,197,94,.24);border-radius:14px;background:rgba(34,197,94,.08);color:#d1fae5;font-size:12px;line-height:1.45;white-space:pre-line}.download-strip{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0;padding:10px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.download-strip .button{min-height:34px;padding:7px 10px;font-size:12px}.done-note{display:none;width:100%;padding:8px 10px;border:1px solid rgba(34,197,94,.25);border-radius:12px;background:rgba(34,197,94,.08);color:#bbf7d0;font-size:12px;font-weight:800}.filterbar{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0}.filterbar button{min-height:30px;padding:6px 10px;border-radius:999px;font-size:11px;background:rgba(30,41,59,.72);color:#cbd5e1}.filterbar button.active{background:rgba(96,165,250,.22);color:#dbeafe;border:1px solid rgba(96,165,250,.32)}.log-details{margin-top:8px;border:1px solid var(--line);border-radius:15px;background:rgba(2,6,23,.22);overflow:hidden}.log-details>summary{cursor:pointer;list-style:none;padding:9px 11px;color:#cbd5e1;font-size:12px;font-weight:850}.log-details>summary::-webkit-details-marker{display:none}.actions-menu{position:relative;display:flex;justify-content:flex-end}.actions-menu summary{list-style:none;cursor:pointer;min-height:34px;padding:7px 11px;border-radius:12px;background:rgba(30,41,59,.92);font-size:12px;font-weight:900;color:#fff}.actions-menu summary::-webkit-details-marker{display:none}.actions-pop{position:absolute;right:0;top:40px;z-index:10;display:grid;gap:6px;min-width:150px;padding:8px;border:1px solid var(--line);border-radius:14px;background:#0f172a;box-shadow:0 18px 40px rgba(0,0,0,.35)}.actions-pop .button,.actions-pop button{width:100%;justify-content:flex-start;min-height:32px;padding:7px 9px;font-size:12px;border-radius:10px}
+    .status{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.metric{border:1px solid rgba(148,163,184,.18);border-radius:18px;padding:12px;background:linear-gradient(180deg,rgba(15,23,42,.72),rgba(2,6,23,.50))}.metric strong{display:block;font-size:21px;letter-spacing:-.03em}.metric span{color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+    .progress{height:9px;border-radius:999px;background:rgba(2,6,23,.8);border:1px solid var(--line);overflow:hidden;margin:12px 0}.progress>div{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#22c55e,#86efac);transition:width .25s ease}
+    .logbox{min-height:170px;max-height:260px;overflow:auto;background:rgba(2,6,23,.62);border:1px solid var(--line);border-radius:17px;padding:8px;font-size:11px;line-height:1.42}.log-line{display:grid;grid-template-columns:52px minmax(0,1fr);gap:7px;padding:5px 7px;border-radius:10px;color:#cbd5e1}.log-line:nth-child(odd){background:rgba(148,163,184,.04)}.log-time{color:#64748b;font-family:ui-monospace,monospace}.log-msg{min-width:0;overflow-wrap:anywhere}.log-ok{color:var(--ok)}.log-fail{color:#fda4af}.log-warn{color:#fde68a}
+    .wide-panels{display:grid;gap:14px;margin-top:18px}.data-panel{border:1px solid rgba(148,163,184,.20);border-radius:var(--radius);background:linear-gradient(180deg,rgba(15,23,42,.86),rgba(2,6,23,.68));box-shadow:var(--shadow);overflow:visible}.data-panel>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;background:linear-gradient(135deg,rgba(96,165,250,.10),rgba(34,197,94,.05));border-bottom:1px solid transparent}.data-panel>summary::-webkit-details-marker{display:none}.data-panel[open]>summary{border-bottom-color:var(--line)}.summary-main{display:flex;align-items:center;gap:11px;min-width:0}.summary-icon{display:grid;place-items:center;width:30px;height:30px;border-radius:10px;background:rgba(96,165,250,.12);border:1px solid rgba(96,165,250,.20);font-size:14px}.summary-text{min-width:0}.summary-title{display:block;color:#e0f2fe;font-size:14px;font-weight:950}.summary-desc{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.35}.summary-action{display:inline-flex;align-items:center;gap:8px;color:#cbd5e1;font-size:12px;font-weight:900;white-space:nowrap}.summary-action:after{content:'▾';display:grid;place-items:center;width:24px;height:24px;border-radius:999px;background:rgba(15,23,42,.72);border:1px solid var(--line);transition:transform .18s}.data-panel[open] .summary-action:after{transform:rotate(180deg)}.panel-body{padding:12px 14px 14px}.empty-note{display:none;margin:10px 0 0;color:var(--muted);font-size:12px}.history-cards{display:grid;gap:8px}.history-card{display:grid;grid-template-columns:minmax(210px,1fr) minmax(160px,.7fr) auto;gap:12px;align-items:center;border:1px solid rgba(148,163,184,.13);border-radius:16px;padding:10px 12px;background:rgba(2,6,23,.26)}.history-id{font-family:ui-monospace,monospace;color:#dbeafe;font-size:12px}.history-meta{color:var(--muted);font-size:11px;margin-top:4px}
+    .step-card{border:1px solid rgba(148,163,184,.14);border-radius:18px;padding:12px;background:rgba(15,23,42,.30)}
+    .step-title{display:flex;align-items:center;gap:8px;margin:0 0 10px;color:#e0f2fe;font-size:13px;font-weight:950}.step-no{display:grid;place-items:center;width:24px;height:24px;border-radius:999px;background:rgba(96,165,250,.16);border:1px solid rgba(96,165,250,.30);color:#bfdbfe;font-size:12px}.step-sub{margin-left:auto;color:var(--muted);font-size:11px;font-weight:700}
+    .parse-preview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:9px}.student-guide{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0 10px}.preview-chip{border:1px solid rgba(148,163,184,.16);border-radius:13px;background:rgba(2,6,23,.38);padding:8px 9px}.preview-chip strong{display:block;font-size:15px;color:#e0f2fe}.preview-chip span{display:block;margin-top:2px;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.preview-chip.ok strong{color:var(--ok)}.preview-chip.warn strong{color:var(--warn)}
+    .action-picks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    .action-pick{display:flex;flex-direction:column;gap:4px;margin:0;padding:14px 14px 14px 42px;border:1px solid rgba(148,163,184,.18);border-radius:16px;background:rgba(15,23,42,.52);position:relative;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:600}
+    .action-pick input{position:absolute;left:14px;top:16px;width:16px;height:16px;accent-color:#22c55e}
+    .action-pick strong{color:#e0f2fe;font-size:14px;font-weight:900}
+    .action-pick span{color:var(--muted);font-size:11px;line-height:1.4;font-weight:600}
+    .action-pick:hover{border-color:rgba(96,165,250,.42)}
+    .action-pick:has(input:checked){border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.08)}
+    .password-box{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:16px;background:rgba(2,6,23,.28)}
+    .ledger-panel{display:none;margin:10px 0 0;border:1px solid var(--line);border-radius:16px;overflow:hidden;background:rgba(2,6,23,.24)}
+    .ledger-panel.show{display:block}
+    .ledger-table{width:100%;margin:0;border:0;border-radius:0;font-size:11px;border-collapse:separate;border-spacing:0}
+    .ledger-table th{position:sticky;top:0;z-index:1;color:#cbd5e1;background:rgba(15,23,42,.86);font-size:11px;text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
+    .ledger-table td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+    .ledger-table tr:last-child td{border-bottom:0}
+    .ledger-email{font-family:ui-monospace,monospace;color:#dbeafe;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .row-status{display:inline-flex;align-items:center;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:900}
+    .row-status.ok{background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.30);color:var(--ok)}
+    .row-status.fail{background:rgba(251,113,133,.10);border:1px solid rgba(251,113,133,.30);color:#fda4af}
+    .row-status.run{background:rgba(96,165,250,.10);border:1px solid rgba(96,165,250,.30);color:#93c5fd}
+    .row-status.warn{background:rgba(251,191,36,.10);border:1px solid rgba(251,191,36,.30);color:#fde68a}
+    .credential-modal-card{width:min(1080px,100%);max-height:calc(100vh - 36px);overflow:auto}.credential-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.credential-modal-close{min-height:32px;padding:6px 10px;border-radius:10px;font-size:12px}.credential-meta{margin:6px 0 0;color:var(--muted);font-size:12px;line-height:1.45}.credential-toolbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;padding:10px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.credential-list{display:grid;gap:10px;margin-top:12px}.credential-row{border:1px solid rgba(251,113,133,.24);border-radius:15px;padding:11px;background:rgba(127,29,29,.08)}.credential-row-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.credential-row-title{min-width:0;color:#e0f2fe;font-size:13px;font-weight:900}.credential-row-title code{color:#bfdbfe;font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}.credential-error{margin-top:6px;color:#fda4af;font-size:11px;line-height:1.4;overflow-wrap:anywhere}.credential-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}.credential-field{min-width:0}.credential-field label{margin-bottom:4px;font-size:10px;color:#94a3b8;text-transform:none;letter-spacing:0}.credential-field input{font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;padding:8px 9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.credential-line-label{display:block;margin:10px 0 4px;color:#94a3b8;font-size:10px}.credential-line{width:100%;min-height:45px;max-height:110px;resize:vertical;font-size:11px;padding:8px 9px}.credential-row-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}.credential-empty{padding:24px 10px;text-align:center;border:1px dashed var(--line2);border-radius:14px;color:var(--muted);font-size:12px}
+    .modal-backdrop{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(2,6,23,.72);backdrop-filter:blur(12px)}.modal-backdrop.show{display:flex}.modal-card{width:min(420px,100%);border:1px solid rgba(148,163,184,.24);border-radius:22px;background:linear-gradient(180deg,rgba(15,23,42,.98),rgba(2,6,23,.96));box-shadow:0 30px 90px rgba(0,0,0,.50);padding:18px}.modal-title{margin:0;color:#e0f2fe;font-size:17px;font-weight:950}.modal-error{display:none;margin-top:8px;color:#fda4af;font-size:12px;font-weight:800}
+    .ok{color:var(--ok)}.fail{color:var(--bad)}.muted{color:var(--muted)}.badge.ok{color:var(--ok);border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}.badge.fail{color:#fda4af;border-color:rgba(251,113,133,.35);background:rgba(251,113,133,.08)}.badge.run{color:#93c5fd;border-color:rgba(96,165,250,.35);background:rgba(96,165,250,.08)}
+    @media(min-width:1500px){textarea{min-height:190px}.logbox{min-height:220px;max-height:320px}}
+    @media(max-width:980px){.parse-preview,.action-picks,.student-guide{grid-template-columns:1fr}.credential-fields{grid-template-columns:1fr}main{padding:14px 10px 24px}.topbar{display:block}.session{justify-content:flex-start;margin-top:10px}.shell{grid-template-columns:1fr}.grid2{grid-template-columns:1fr}.status{grid-template-columns:repeat(2,1fr)}textarea{min-height:180px}.card-head,.card-body{padding-left:13px;padding-right:13px}.primary{width:100%}.history-card{grid-template-columns:1fr}.actions-menu{justify-content:flex-start}.actions-pop{left:0;right:auto}.summary-action span{display:none}}
+  </style>
+</head>
+<body>
+<main>
+  <header class="topbar">
+    <div>
+      <span class="eyebrow">独立于获取 JSON</span>
+      <h1>改密 / 2FA</h1>
+      <p class="subtitle">只登录账号，再按勾选项单独改密码、单独改 2FA，或两项一起改。不换 token、不写 JSON。新密码会先写入台账，成功或失败后再更新状态。</p>
+    </div>
+    <form class="session" method="post" action="/logout">
+      <span class="pill">{{ customer_name }}</span>
+      <a class="button secondary" href="/">获取 JSON</a>
+      <a class="button secondary nav-current" href="/security">改密 / 2FA</a>
+      <a class="button secondary" href="/convert">格式转换</a>
+      <button class="secondary" type="submit">退出</button>
+    </form>
+  </header>
+
+  <div class="shell">
+    <section class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">改密任务</h2><p class="card-desc">学生号改的是 AWS Builder ID（PASS AWS），Outlook 密码不动。IDC 打开门户后改密或绑定 authenticator；GitHub 个人号直接进入 GitHub 安全设置。</p></div>
+        <span class="pill">默认保留 {{ export_ttl_seconds // 60 }} 分钟</span>
+      </div>
+      <div class="card-body stack">
+        <div class="form-section step-card">
+          <div class="step-title"><span class="step-no">1</span><span>账号导入</span><span class="step-sub">支持 IDC、学生号与 GitHub 个人号</span></div>
+          <div><label>登录方式</label><select id="loginMode"><option value="idc">AWS IAM Identity Center</option><option value="student">Kiro 学生号（AWS Builder ID）</option><option value="github">GitHub 个人号</option></select><div class="hint" id="loginModeHint">IDC 需要 Start URL，或每行自带 login_url。</div></div>
+          <div id="accountModeRow" style="margin-top:10px"><label>账号格式</label><select id="accountMode"><option value="auto" selected>自动识别（| / ---- / 标签）</option><option value="standard">学生号 TYPE 块</option><option value="fixed">固定列格式</option><option value="student">学生号旧格式</option></select></div>
+          <div id="studentFieldGuide" class="student-guide" style="display:none">
+            <div class="preview-chip"><strong>邮箱|Outlook|AWS</strong><span>| 或 ---- 分隔</span></div>
+            <div class="preview-chip"><strong>第四段可带 MFA</strong><span>已绑定 2FA 时填写</span></div>
+            <div class="preview-chip"><strong>TYPE 块</strong><span>LOGIN + MAIL_PASSWORD + PASSWORD</span></div>
+          </div>
+          <textarea id="accounts" placeholder="每行一个账号：&#10;user@example.com|Password123&#10;user@example.com----Password123----MFASECRET"></textarea>
+          <textarea id="studentAccounts" style="display:none" placeholder="每行一个：&#10;student@university.edu|Outlook密码|AWS密码&#10;student@university.edu|Outlook密码|AWS密码|MFASECRET"></textarea>
+          <div class="micro" id="fixedHint" style="display:none;margin-top:6px">固定格式下每行：账号 密码 2fa（第三列可空），以空格分隔。</div>
+          <div class="micro" id="studentHint" style="display:none;margin-top:6px">学生号：邮箱|Outlook密码|AWS密码，可选第四段 MFA。改密改的是 AWS 密码。</div>
+          <div class="micro" id="studentFixedHint" style="display:none;margin-top:6px">当前为固定列格式（空格分隔）。</div>
+          <div class="parse-preview" id="parsePreview">
+            <div class="preview-chip"><strong id="pvAccounts">0</strong><span>账号</span></div>
+            <div class="preview-chip" id="pvMfaBox"><strong id="pvMfa">0</strong><span>MFA</span></div>
+            <div class="preview-chip" id="pvMailPwBox" style="display:none"><strong id="pvMailPw">0</strong><span>Outlook密码</span></div>
+            <div class="preview-chip" id="pvAwsPwBox" style="display:none"><strong id="pvAwsPw">0</strong><span>AWS密码</span></div>
+            <div class="preview-chip" id="pvUrlBox"><strong id="pvUrl">未识别</strong><span>Start URL</span></div>
+            <div class="preview-chip" id="pvModeBox"><strong id="pvMode">自动</strong><span>解析模式</span></div>
+          </div>
+        </div>
+
+        <div class="form-section step-card">
+          <div class="step-title"><span class="step-no">2</span><span>要改什么</span><span class="step-sub">可只改一项，也可两项一起</span></div>
+          <div class="action-picks">
+            <label class="action-pick"><input id="changePasswordOpt" type="checkbox" checked><strong>修改密码</strong><span>学生号改 PASS AWS，GitHub 改个人号密码。新密码先写入台账，站点接受后再把状态改成成功/失败。</span></label>
+            <label class="action-pick"><input id="changeMfaOpt" type="checkbox" checked><strong>设置或更换 2FA</strong><span>绑定新 authenticator；GitHub 按官方安全设置替换 Authenticator app。抠到密钥会立刻落盘，即使后续步骤失败也能下载新密钥。</span></label>
+            <label class="action-pick"><input id="cleanMfaOnlyOpt" type="checkbox"><strong>仅清理 MFA</strong><span>不改密码、不新增 MFA。账号必须提供要保留的 MFA，登录后删除其它 MFA。</span></label>
+          </div>
+          <div id="passwordSettings" class="password-box">
+            <div><label>密码怎么设置</label><select id="passwordMode"><option value="random">每号随机新密码</option><option value="fixed" selected>所有账号用同一固定密码</option></select><div class="hint">随机密码符合 AWS 策略（大小写+数字+符号）。固定模式请自己填目标新密码。</div></div>
+            <div id="fixedPasswordRow" style="margin-top:10px">
+              <label>目标新密码</label><input id="newPassword" value="{{ default_new_password }}" autocomplete="off">
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section step-card">
+          <div class="step-title"><span class="step-no">3</span><span>必要配置</span><span class="step-sub">代理、并发、超时</span></div>
+          <div id="startUrlRow"><label>IDC Start URL</label><input id="startUrl" value="" placeholder="{{ default_start_url }}"></div>
+          <div class="grid2" style="margin-top:10px">
+            <div><label>OIDC Region</label><select id="oidcRegion"><option selected>us-east-1</option><option>us-east-2</option><option>us-west-1</option><option>us-west-2</option><option>eu-central-1</option><option>eu-west-1</option><option>eu-west-2</option><option>ap-southeast-1</option><option>ap-northeast-1</option></select></div>
+            <div><label>Kiro Region</label><select id="kiroRegion"><option selected>us-east-1</option><option>us-east-2</option><option>us-west-1</option><option>us-west-2</option><option>eu-central-1</option><option>eu-west-1</option><option>eu-west-2</option><option>ap-southeast-1</option><option>ap-northeast-1</option></select></div>
+          </div>
+          <details class="advanced" style="margin-top:10px">
+            <summary>更多配置（并发 / 超时 / 代理）</summary>
+            <div class="advanced-body">
+              <div class="grid2">
+                <div><label>并行数</label><select id="threads"><option selected>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select><div class="hint">并发运行时每个活跃浏览器使用不同代理出口；健康节点不足会自动降并发。</div></div>
+                <div><label>单账号超时</label><input id="loginTimeout" type="number" min="60" max="600" step="10" value="240"></div>
+                <div><label>失败等待</label><input id="failureWait" type="number" min="{{ min_failure_wait }}" max="{{ max_failure_wait }}" step="5" value="{{ default_failure_wait }}"></div>
+                <div><label>数据保留（分钟）</label><input id="retentionMinutes" type="number" min="{{ min_retention_minutes }}" max="{{ max_retention_minutes }}" step="5" value="{{ default_retention_minutes }}"></div>
+              </div>
+              <div>
+                <label>代理池（每行一个，轮流分配）</label>
+                <textarea id="proxyPool" rows="3" placeholder="http://user:pass@1.2.3.4:8080&#10;socks5://5.6.7.8:1080"></textarea>
+                <div style="margin-top:10px">
+                  <label>VPN 订阅 URL（Clash / Mihomo）</label>
+                  <input id="proxySubscription" placeholder="https://example.com/sub?token=...">
+                  <div class="hint">填了订阅时优先用订阅节点；运行时筛选可用节点，为并发浏览器启动独立本地 mihomo 端口。</div>
+                </div>
+                <div style="margin-top:6px;display:flex;align-items:center;gap:8px">
+                  <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-weight:normal;text-transform:none;letter-spacing:0"><input type="checkbox" id="saveProxyPool"> 保存代理池</label>
+                  <button type="button" id="btnSaveProxyPool" class="secondary" style="min-height:32px;padding:4px 10px;font-size:12px">立即保存</button>
+                  <span id="proxyPoolMsg" class="hint" style="margin:0"></span>
+                </div>
+              </div>
+              <label class="hint" style="display:flex;gap:8px;align-items:center;text-transform:none;letter-spacing:0;font-weight:700"><input id="normalizeSymbols" type="checkbox" checked> 密码中的全角符号转半角</label>
+            </div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">任务控制台</h2><p class="card-desc">新密码会在改密前提前写入台账，可随时下载。</p></div>
+        <span class="pill" id="jobId">未开始</span>
+      </div>
+      <div class="card-body">
+        <div class="console-actions">
+          <button id="start" class="primary run-cta">开始改密 / 2FA</button>
+          <button id="stopJob" class="danger" type="button" style="display:none">中断</button>
+          <button id="retryJob" class="secondary" type="button" style="display:none">重试失败项</button>
+          <button id="failedAccountsJob" class="secondary" type="button" style="display:none">查看失败账号</button>
+        </div>
+        <div class="status">
+          <div class="metric"><strong id="mStatus">-</strong><span>状态</span></div>
+          <div class="metric"><strong id="mDone">0/0</strong><span>进度</span></div>
+          <div class="metric"><strong id="mOk">0</strong><span>成功</span></div>
+          <div class="metric"><strong id="mFail">0</strong><span>失败</span></div>
+        </div>
+        <div class="progress"><div id="progressBar"></div></div>
+        <div id="taskSummary" class="task-summary"></div>
+        <div class="download-strip">
+          <div id="doneNote" class="done-note">任务已完成，可下载按完全成功 / 部分成功 / 没有修改分块的账密 MFA 文件，以及账号密码 / 密码台账 / 改密MFA汇总 / MFA / 日志。</div>
+          <a id="downloadCombinedMobile" class="button secondary" href="#" style="display:none">账密 MFA（分块）</a>
+          <a id="downloadAccountsPwMobile" class="button secondary" href="#" style="display:none">账号密码</a>
+          <a id="downloadLedgerMobile" class="button secondary" href="#" style="display:none">密码台账</a>
+          <a id="downloadSecurityChangesMobile" class="button secondary" href="#" style="display:none">改密MFA汇总</a>
+          <a id="downloadMfaMobile" class="button secondary" href="#" style="display:none">MFA</a>
+          <a id="downloadLogsMobile" class="button secondary" href="#" style="display:none">日志</a>
+          <span id="downloadEmpty" class="muted">完成后显示分块账密 MFA / 密码台账 / 改密MFA汇总 / 日志下载</span>
+        </div>
+        <div id="ledgerPanel" class="ledger-panel">
+          <div class="result-head" style="display:flex;align-items:center;justify-content:space-between;padding:9px 11px;border-bottom:1px solid var(--line)"><span class="result-title" style="font-size:12px;font-weight:950;color:#dbeafe">密码台账</span><span class="micro">先记录密码，再更新状态</span></div>
+          <div class="result-table-wrap" style="max-height:220px;overflow:auto">
+            <table class="ledger-table"><thead><tr><th>账号</th><th>状态</th><th>新密码</th></tr></thead><tbody id="ledgerBody"></tbody></table>
+          </div>
+        </div>
+        <details class="log-details" open>
+          <summary>查看运行日志</summary>
+          <div class="filterbar" id="logFilters">
+            <button type="button" class="active" data-filter="all">全部</button>
+            <button type="button" data-filter="ok">成功</button>
+            <button type="button" data-filter="warn">警告</button>
+            <button type="button" data-filter="fail">失败</button>
+          </div>
+          <div id="logs" class="logbox"></div>
+        </details>
+      </div>
+    </section>
+  </div>
+
+  <section class="wide-panels">
+    <details class="data-panel" open>
+      <summary>
+        <span class="summary-main"><span class="summary-icon">🕘</span><span class="summary-text"><span class="summary-title">改密 / 2FA 历史</span><span class="summary-desc">只列出改密任务。获取 JSON 的任务在登录页查看。</span></span></span>
+        <span class="summary-action"><span>点击收起</span></span>
+      </summary>
+      <div class="panel-body">
+        <div id="history" class="history-cards" style="display:none"></div>
+        <div id="historyEmpty" class="empty-note">暂无改密 / 2FA 批次。</div>
+      </div>
+    </details>
+  </section>
+</main>
+
+<div id="failedAccountsModal" class="modal-backdrop" aria-hidden="true">
+  <div class="modal-card credential-modal-card" role="dialog" aria-modal="true">
+    <div class="credential-modal-head">
+      <div>
+        <h3 class="modal-title">失败账号凭据</h3>
+        <p id="failedAccountsModalMeta" class="credential-meta">加载中...</p>
+      </div>
+      <button id="failedAccountsModalClose" class="secondary credential-modal-close" type="button">关闭</button>
+    </div>
+    <div id="failedAccountsModalError" class="modal-error"></div>
+    <div class="credential-toolbar">
+      <button id="copyFailedAccounts" class="secondary" type="button">复制全部</button>
+      <button id="fillFailedAccounts" class="primary" type="button">回填全部到输入框</button>
+    </div>
+    <div id="failedAccountsList" class="credential-list"><div class="credential-empty">正在加载失败账号...</div></div>
+  </div>
+</div>
+<script>
+let currentJob=null,timer=null,currentLogFilter='all',lastLogLines=[],failedCredentialPayload=null,failedCredentialRows=[];
+const $=id=>document.getElementById(id);
+const DEFAULT_START_URL={{ default_start_url|tojson }};
+function escapeHtml(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+function loginModeValue(){return ($('loginMode')&&$('loginMode').value)||'idc'}
+function startUrlValue(){return ($('startUrl')&&$('startUrl').value.trim())||''}
+function looksLikeIdcStartUrl(value){const v=String(value||'').trim();return /^https:\/\/[^/\s]+\.awsapps\.com(?:[/?#]|$)/i.test(v)||/^https:\/\/[^/\s]+\.portal\.[a-z0-9-]+\.app\.aws(?:[/?#]|$)/i.test(v)||/^https:\/\/ssoins-[0-9a-f]+\.[a-z0-9-]+\.portal\.amazonaws\.com(?:[/?#]|$)/i.test(v)}
+function maybeFillStartUrlFromAccounts(){const input=$('startUrl'),text=$('accounts').value||'';if(!input||input.value.trim())return;const m=text.match(/Default AWS access portal URL \(IPv4 only\):\s*(https?:\/\/\S+)/i)||text.match(/Dual-stack AWS access portal URL:\s*(https?:\/\/\S+)/i);if(m){input.value=m[1].trim();return}const lines=(text||'').split(/\n/);for(const raw of lines){const l=raw.trim();if(!l.includes('----')&&!l.includes('|'))continue;const parts=l.includes('----')?l.split('----'):l.split('|');for(const part of parts){const v=part.trim().replace(/^idc::/i,'');if(looksLikeIdcStartUrl(v)){input.value=v;return}}}}
+function accountsText(){if(loginModeValue()==='student'&&$('studentAccounts'))return $('studentAccounts').value||'';return ($('accounts')&&$('accounts').value)||''}
+function isStandardFieldLine(l){return /^\s*(type|login|password|mail_password|mfa_secret|start_url|region|proxy)\s*[:=]/i.test(l||'')}
+function estimateStandardAccounts(text,loginMode){
+  const blocks=(text||'').split(/\n\s*\n/);
+  const wanted=String(loginMode||'').toLowerCase()==='student'?'student':String(loginMode||'').toLowerCase();
+  let count=0,mailPw=0,awsPw=0,mfa=0;
+  blocks.forEach(block=>{
+    const get=(key)=>{const re=new RegExp('^\\s*'+key+'\\s*[:=]\\s*(.*?)\\s*$','im');const hit=block.match(re);return hit?hit[1].trim():''};
+    const type=get('TYPE').toLowerCase().replace(/[\s-]+/g,'_');
+    const normalized=type==='aws'||type==='aws_student'||type==='builder_id'||type==='builderid'?'student':type;
+    const login=get('LOGIN'),password=get('PASSWORD'),mail=get('MAIL_PASSWORD'),secret=get('MFA_SECRET');
+    if(login&&password&&normalized===wanted){count++;if(mail)mailPw++;if(password)awsPw++;if(secret)mfa++}
+  });
+  return {count,mfa,url:'',mode:'standard',mailPw,awsPw};
+}
+function estimateStudentAccounts(text){
+  const rawLines=(text||'').split(/\n/);
+  const mfaRe=/^[A-Z2-7]{16,64}$/i;
+  const looksMfa=(v)=>{const s=String(v||'').replace(/[\s-]/g,'').replace(/^(?:mfa|2fa|totp)\s*[:=]/i,'');return mfaRe.test(s)};
+  let count=0,mailPw=0,awsPw=0,mfa=0;
+  let cur={email:false,mail:false,aws:false,mfa:false};
+  const flush=()=>{if(cur.email&&(cur.mail||cur.aws)){count++;mailPw++;awsPw++;if(cur.mfa)mfa++}cur={email:false,mail:false,aws:false,mfa:false}};
+  for(const raw of rawLines){
+    const l=raw.trim();
+    if(!l){flush();continue}
+    if(l.startsWith('#')||isStandardFieldLine(l))continue;
+    if(/^email\s*\|\s*emailpass\s*\|\s*awspass\s*\|\s*mfa$/i.test(l))continue;
+    const hasPassMail=/PASS\s*MAIL\s*[:：]|邮箱密码\s*[:：]|outlook密码\s*[:：]/i.test(l);
+    const hasPassAws=/PASS\s*AWS\s*[:：]|AWS密码\s*[:：]/i.test(l);
+    const stripped=l.replace(/PASS\s*MAIL\s*[:：]/ig,' ').replace(/PASS\s*AWS\s*[:：]/ig,' ');
+    const hasMail=/(?:^|\s)(?:MAIL|邮箱)\s*[:：]/i.test(stripped);
+    if([hasMail,hasPassMail,hasPassAws].filter(Boolean).length>=2){flush();count++;mailPw++;awsPw++;if(looksMfa(l.split(/[:：]/).pop()))mfa++;continue}
+    if(/^(PASS\s*MAIL|邮箱密码|outlook密码)\s*[:：]\s*\S+/i.test(l)){cur.mail=true;continue}
+    if(/^(PASS\s*AWS|AWS密码)\s*[:：]\s*\S+/i.test(l)){cur.aws=true;continue}
+    if(/^(2FA|MFA|TOTP|密钥)\s*[:：]\s*\S+/i.test(l)){cur.mfa=true;continue}
+    if(/^(MAIL|邮箱|账号)\s*[:：]\s*\S+/i.test(l)){if(cur.email)flush();cur.email=true;continue}
+    const sep=l.includes('----')?'----':(l.includes('|')?'|':null);
+    if(sep){const parts=l.split(sep).map(x=>x.trim()).filter(Boolean);if(parts.length>=2){flush();count++;mailPw++;awsPw++;if(parts.some(looksMfa))mfa++}continue}
+    const parts=l.split(/\s+/).filter(Boolean);
+    if(parts.length>=2&&!/^(email|username|user|account|账号|mail)$/i.test(parts[0])){flush();count++;mailPw++;awsPw++;if(parts.some(looksMfa))mfa++}
+  }
+  flush();
+  return {count,mfa,url:'',mode:'student',mailPw,awsPw};
+}
+function estimateAccounts(){
+  const text=accountsText(),mode=($('accountMode')&&$('accountMode').value)||'auto',loginMode=loginModeValue();
+  const std=estimateStandardAccounts(text,loginMode);
+  if(mode==='student'||loginMode==='student'){
+    if(mode==='fixed'){
+      const lines=text.split(/\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')&&!isStandardFieldLine(x));
+      let count=0,mfa=0;const mfaRe=/^[A-Z2-7]{16,64}$/i;
+      lines.forEach(l=>{const parts=l.split(/\s+/).filter(Boolean);if(parts.length>=2&&!/^(email|username|user|account|账号)$/i.test(parts[0])){count++;if(parts[3]&&mfaRe.test(parts[3]))mfa++}});
+      return {count:count+std.count,mfa:mfa+std.mfa,url:'',mode:'fixed',mailPw:count+std.mailPw,awsPw:count+std.awsPw};
+    }
+    const p=estimateStudentAccounts(text);
+    const mixed=std.count>0&&p.count>0;
+    return {count:p.count+std.count,mfa:p.mfa+std.mfa,url:'',mode:mixed?'mixed':(std.count?'standard':'student'),mailPw:(p.mailPw||0)+(std.mailPw||0),awsPw:(p.awsPw||0)+(std.awsPw||0)};
+  }
+  const lines=text.split(/\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')&&!isStandardFieldLine(x));
+  let count=0,mfa=0,pipeUrl='';
+  const mfaRe=/^[A-Z2-7\s-]{16,}$/i;
+  if(mode==='fixed'){
+    lines.forEach(l=>{const parts=l.split(/\s+/).filter(Boolean);if(parts.length>=2&&!/^(email|username|user|account|账号)$/i.test(parts[0])){count++;if(parts[2]&&mfaRe.test(parts[2]))mfa++}});
+  }else{
+    lines.forEach(l=>{
+      const pipeParts=l.split('|').map(x=>x.trim()),isPipeStartUrl=looksLikeIdcStartUrl(pipeParts[0]||'');
+      if(isPipeStartUrl&&pipeParts.length>=4){count++;if(!pipeUrl)pipeUrl=pipeParts[0];if(pipeParts.some((p,idx)=>idx>=5&&mfaRe.test(p)))mfa++;return}
+      const dash4=l.indexOf('----'),dashSep=dash4>=0?'----':'';
+      if(dashSep){const dashParts=l.split(dashSep).map(x=>x.trim()).filter(Boolean);const leftovers=[];let hasMfa=false;dashParts.forEach(p=>{const stripped=p.replace(/^idc::/i,'').trim();if(looksLikeIdcStartUrl(stripped)){if(!pipeUrl)pipeUrl=stripped;return}if(/^[a-z]{2}-[a-z]+-\d+$/i.test(p))return;const secret=p.replace(/^\s*(?:mfa|2fa|totp|mfa_secret)\s*[:=]\s*/i,'').replace(/[\s-]/g,'');if(/^[A-Z2-7]{16,64}$/i.test(secret)){hasMfa=true;return}if(/^(https?:\/\/|socks5h?:\/\/)/i.test(p)||/^(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}$/.test(p))return;leftovers.push(p)});if(leftovers.length>=2){count++;if(hasMfa)mfa++}return}
+      if(/^Username\s*:/i.test(l)||/^[^:\s|]+@?[^:\s|]*[:|,;\t].+/.test(l))count++;
+    });
+  }
+  const url=startUrlValue()||pipeUrl||'';
+  return{count:count+std.count,mfa:mfa+std.mfa,url,mode:mode==='fixed'?'fixed':(std.count?'standard':mode)};
+}
+function updateParsePreview(){const p=estimateAccounts();if($('pvAccounts'))$('pvAccounts').textContent=p.count;if($('pvMfa'))$('pvMfa').textContent=p.mfa;if($('pvUrl'))$('pvUrl').textContent=p.url?'已识别':'未识别';if($('pvMode'))$('pvMode').textContent=p.mode==='fixed'?'固定':(p.mode==='mixed'?'混合':(p.mode==='student'?'学生号':(p.mode==='standard'?'TYPE块':'自动')));const ub=$('pvUrlBox');if(ub){ub.classList.toggle('ok',!!p.url);ub.classList.toggle('warn',!p.url)}const mb=$('pvModeBox');if(mb)mb.classList.toggle('ok',p.count>0);const mailBox=$('pvMailPwBox');if(mailBox){mailBox.style.display=loginModeValue()==='student'?'':'none';if($('pvMailPw'))$('pvMailPw').textContent=p.mailPw||0;mailBox.classList.toggle('ok',(p.mailPw||0)>0);mailBox.classList.toggle('warn',loginModeValue()==='student'&&p.count>0&&!(p.mailPw>0))}const awsBox=$('pvAwsPwBox');if(awsBox){awsBox.style.display=loginModeValue()==='student'?'':'none';if($('pvAwsPw'))$('pvAwsPw').textContent=p.awsPw||0;awsBox.classList.toggle('ok',(p.awsPw||0)>0);awsBox.classList.toggle('warn',loginModeValue()==='student'&&p.count>0&&!(p.awsPw>0))}}
+function changePasswordChecked(){return !!($('changePasswordOpt')&&$('changePasswordOpt').checked)}
+function changeMfaChecked(){return !!($('changeMfaOpt')&&$('changeMfaOpt').checked)}
+function cleanMfaOnlyChecked(){return !!($('cleanMfaOnlyOpt')&&$('cleanMfaOnlyOpt').checked)}
+function payload(){const clean=cleanMfaOnlyChecked();return{accounts:accountsText(),accountMode:($('accountMode')&&$('accountMode').value)||'auto',loginMode:loginModeValue(),startUrl:startUrlValue(),newPassword:($('newPassword')&&$('newPassword').value)||'',passwordMode:($('passwordMode')&&$('passwordMode').value)||'fixed',oidcRegion:($('oidcRegion')&&$('oidcRegion').value)||'us-east-1',kiroRegion:($('kiroRegion')&&$('kiroRegion').value)||'us-east-1',normalizeSymbols:$('normalizeSymbols')?$('normalizeSymbols').checked:true,threads:Number(($('threads')&&$('threads').value)||1),loginTimeout:Number(($('loginTimeout')&&$('loginTimeout').value)||240),failureWait:Number(($('failureWait')&&$('failureWait').value)||{{ default_failure_wait }}),retentionMinutes:Number(($('retentionMinutes')&&$('retentionMinutes').value)||{{ default_retention_minutes }}),proxyPool:($('proxyPool')&&$('proxyPool').value)||'',proxySubscription:($('proxySubscription')&&$('proxySubscription').value)||'',saveProxyPool:($('saveProxyPool')&&$('saveProxyPool').checked)||false,changePassword:clean?false:changePasswordChecked(),changeMfa:clean?false:changeMfaChecked(),cleanMfaOnly:clean,removeOldMfa:clean}}
+function setBusy(b){$('start').disabled=b;$('start').textContent=b?'运行中...':'开始改密 / 2FA';const sb=$('stopJob');if(sb)sb.style.display=b?'inline-flex':'none';const rb=$('retryJob');if(b&&rb)rb.style.display='none';const fb=$('failedAccountsJob');if(b&&fb)fb.style.display='none'}
+function setDownloads(id,accountsPw,ledger,securityChanges,mfa,log,combined){let shown=0;[['downloadCombinedMobile',combined,'/combined-credentials/download'],['downloadAccountsPwMobile',accountsPw,'/accounts-passwords/download'],['downloadLedgerMobile',ledger,'/password-ledger/download'],['downloadSecurityChangesMobile',securityChanges,'/security-changes/download'],['downloadMfaMobile',mfa,'/mfa-secrets/download'],['downloadLogsMobile',log,'/logs/download']].forEach(([el,on,path])=>{const a=$(el);if(!a)return;if(on&&id){a.href='/api/jobs/'+id+path;a.style.display='inline-flex';shown++}else{a.style.display='none'}});const empty=$('downloadEmpty');if(empty)empty.style.display=shown?'none':'inline';const note=$('doneNote');if(note)note.style.display=shown?'block':'none'}
+function formatCountdown(s){if(s===null||s===undefined)return'运行中';s=Math.max(0,Number(s)||0);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}
+function logType(msg){if(/失败\s*0/.test(msg)&&/成功|完成|导出/.test(msg))return'ok';if(/失败|错误|超时|未获取|不匹配|暂停|拒绝|失效/.test(msg))return'fail';if(/重试|等待|验证码|台账|预先落盘/.test(msg))return'warn';if(/成功|完成|已接受|已更新/.test(msg))return'ok';return'info'}
+function setLogText(t){lastLogLines=[];$('logs').textContent=t}
+function renderLogs(lines){lastLogLines=lines||[];renderFilteredLogs()}
+function renderFilteredLogs(){const box=$('logs');box.innerHTML='';lastLogLines.forEach(line=>{const m=String(line).match(/^\[([^\]]+)\]\s*(.*)$/);const time=m?m[1]:'';const msg=m?m[2]:String(line);const type=logType(msg);if(currentLogFilter!=='all'&&currentLogFilter!==type)return;const row=document.createElement('div');row.className='log-line';if(type==='ok')row.classList.add('log-ok');if(type==='fail')row.classList.add('log-fail');if(type==='warn')row.classList.add('log-warn');row.innerHTML=`<span class="log-time">${escapeHtml(time)}</span><span class="log-msg">${escapeHtml(msg)}</span>`;box.appendChild(row)});box.scrollTop=box.scrollHeight}
+function statusLabel(s){return{queued:'排队',running:'运行中',finished:'完成',failed:'失败',stopped:'已中断',expired:'已过期',lost:'已失效'}[s]||s||'-'}
+function kindLabel(k){return{login:'登录/JSON',change_password:'登录后改密/2FA',json_api_key:'JSON 开通 Key'}[k]||''}
+function displayStatus(d){const base=d&&d.status==='failed'&&Number(d.ok||0)>0?'部分完成':statusLabel(d&&d.status);const kind=kindLabel(d&&d.kind);return kind?kind+' · '+base:base}
+function updateMetrics(d){const total=Number(d.total||0),done=Number(d.done||0);$('mStatus').textContent=displayStatus(d);$('mDone').textContent=`${done}/${total}`;$('mOk').textContent=d.ok;$('mFail').textContent=d.failed;$('progressBar').style.width=(total?Math.round(done*100/total):0)+'%'}
+function failedResultSummary(d){const rows=(d.results||[]).filter(r=>!r.ok);if(!rows.length)return'';const shown=rows.slice(0,10).map(r=>`#${r.idx} ${r.email}: ${r.message||'失败'}`);const more=rows.length>10?`\n……还有 ${rows.length-10} 个失败账号。`:'';return`\n失败账号：\n${shown.join('\n')}${more}`}
+function updateTaskSummary(d){const box=$('taskSummary');if(!box)return;if(!['finished','failed','stopped'].includes(d.status)){box.style.display='none';box.textContent='';return}const total=Number(d.total||0),ok=Number(d.ok||0),fail=Number(d.failed||0);const files=[];if(d.combinedCredentialsDownloadReady)files.push('账密MFA合并');if(d.accountsPwDownloadReady)files.push('账号密码');if(d.passwordLedgerDownloadReady)files.push('密码台账');if(d.securityChangesDownloadReady)files.push('改密MFA汇总');if(d.mfaSecretsDownloadReady)files.push('MFA 密钥');if(d.logDownloadReady)files.push('日志');box.textContent=`${displayStatus(d)}：共 ${total} 个账号，成功 ${ok}，失败 ${fail}。${files.length?'可下载：'+files.join('、'):'暂无可下载文件'}。${failedResultSummary(d)}`;box.style.display='block'}
+function ledgerStatusLabel(status,applied){if(status==='success')return['成功','ok'];if(status==='applied'||(applied&&status==='pending'))return['站点已接受','ok'];if(status==='failed_after_apply')return['改密后失败','warn'];if(status==='pending')return['已预记录','run'];if(status==='failed')return['失败','fail'];return[status||'-','run']}
+function renderLedger(accounts){const panel=$('ledgerPanel'),body=$('ledgerBody');if(!panel||!body)return;const rows=accounts||[];if(!rows.length){panel.classList.remove('show');body.innerHTML='';return}panel.classList.add('show');body.innerHTML=rows.map(item=>{const [label,cls]=ledgerStatusLabel(item.status,item.applied);return`<tr><td class="ledger-email" title="${escapeHtml(item.email||'')}">${escapeHtml(item.email||'')}</td><td><span class="row-status ${cls}">${escapeHtml(label)}</span></td><td class="ledger-email">${escapeHtml(item.newPassword||'')}</td></tr>`}).join('')}
+async function loadLedger(jobId){if(!jobId)return;try{const r=await fetch('/api/jobs/'+encodeURIComponent(jobId)+'/password-ledger',{cache:'no-store'});if(!r.ok)return;const d=await r.json();renderLedger(d.accounts||[])}catch(e){}}
+function accountsHavePipeStartUrl(){const text=($('accounts')&&$('accounts').value)||'';const lines=text.split(/\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#'));return lines.some(l=>{const first=l.split('|')[0];return looksLikeIdcStartUrl(first)&&l.includes('|')})||lines.some(l=>l.includes('----')&&l.split('----').some(p=>looksLikeIdcStartUrl(p.trim().replace(/^idc::/i,''))))}
+function validateJob(){const mode=loginModeValue(),clean=cleanMfaOnlyChecked();if(!['idc','student','github'].includes(mode)){setLogText('错误：登录后改密/2FA 目前支持 AWS IDC、学生号和 GitHub 个人号。');return false}if(clean&&mode!=='student'){setLogText('错误：仅清理 MFA 目前只支持学生号。');return false}if(!clean&&!changePasswordChecked()&&!changeMfaChecked()){setLogText('错误：请至少勾选「修改密码」或「设置或更换 2FA」');return false}if(!accountsText().trim()){setLogText(mode==='student'?'错误：请先粘贴学生号':'错误：请先粘贴账号');return false}const preview=estimateAccounts();if(clean&&Number(preview.mfa||0)<Number(preview.count||0)){setLogText('错误：仅清理 MFA 时，每个账号都必须提供要保留的 MFA。');return false}if(mode==='idc'){maybeFillStartUrlFromAccounts();if(!startUrlValue()&&!accountsHavePipeStartUrl()){setLogText('错误：IDC Start URL 必填（或粘贴每行自带 login_url 的管道格式）');$('startUrl').focus();return false}}if(!clean&&changePasswordChecked()&&$('passwordMode')&&$('passwordMode').value==='fixed'&&!($('newPassword')&&$('newPassword').value.trim())){setLogText('错误：固定密码模式下请填写目标新密码');$('newPassword').focus();return false}return true}
+async function startJob(){if(!validateJob())return;setBusy(true);setDownloads();setLogText('提交改密/2FA 任务...');try{const r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});if(r.status===401){location.href='/login';return}const d=await r.json();if(!r.ok)throw new Error(d.error||'提交失败');currentJob=d.jobId;$('jobId').textContent='改密/2FA '+currentJob;if(timer)clearInterval(timer);timer=setInterval(poll,1500);poll()}catch(e){setBusy(false);setLogText('错误：'+e.message)}}
+async function poll(){if(!currentJob)return;const r=await fetch('/api/jobs/'+currentJob,{cache:'no-store'});if(r.status===401){location.href='/login';return}if(r.status===404){if(timer)clearInterval(timer);setBusy(false);updateMetrics({status:'lost',done:0,total:0,ok:0,failed:0});setLogText('任务记录已失效。');currentJob=null;loadHistory();return}const d=await r.json();updateMetrics(d);updateTaskSummary(d);renderLogs((d.logs||[]).slice(-24));loadLedger(currentJob);if(['queued','running'].includes(d.status)){setDownloads(currentJob,d.accountsPwDownloadReady,d.passwordLedgerDownloadReady,d.securityChangesDownloadReady,d.mfaSecretsDownloadReady,d.logDownloadReady,d.combinedCredentialsDownloadReady)}if(['finished','failed','stopped'].includes(d.status)){clearInterval(timer);setBusy(false);setDownloads(currentJob,d.accountsPwDownloadReady,d.passwordLedgerDownloadReady,d.securityChangesDownloadReady,d.mfaSecretsDownloadReady,d.logDownloadReady,d.combinedCredentialsDownloadReady);const retryable=Number(d.retryableCount||0);const rb=$('retryJob');if(rb){if(retryable>0){rb.style.display='inline-flex';rb.textContent='重试失败项 ('+retryable+')'}else rb.style.display='none'}const fb=$('failedAccountsJob');if(fb){if(retryable>0){fb.style.display='inline-flex';fb.textContent='查看失败账号 ('+retryable+')';fb.onclick=()=>openFailedAccountsModal(currentJob)}else{fb.style.display='none';fb.onclick=null}}loadHistory()}else if(d.stopRequested){const sb=$('stopJob');if(sb){sb.disabled=true;sb.textContent='正在停止...'}}}
+async function stopJob(){if(!currentJob)return;const sb=$('stopJob');if(sb){sb.disabled=true;sb.textContent='中断中...'}try{const r=await fetch('/api/jobs/'+currentJob+'/stop',{method:'POST'});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'中断失败')}catch(e){alert(e.message)}finally{if(sb){sb.disabled=false;sb.textContent='中断'}}}
+async function retryHistoryJob(id,btn){if(btn){btn.disabled=true;btn.textContent='提交重试...'}try{const r=await fetch('/api/jobs/'+id+'/retry',{method:'POST'});const d=await r.json().catch(()=>({}));if(r.status===401){location.href='/login';return}if(!r.ok)throw new Error(d.error||'重试失败');currentJob=d.jobId;$('jobId').textContent='任务 '+currentJob+'（重试 '+(d.retryCount||0)+' 个）';if($('retryJob'))$('retryJob').style.display='none';setBusy(true);setDownloads();setLogText('已提交重试任务...');if(timer)clearInterval(timer);timer=setInterval(poll,1500);poll()}catch(e){alert(e.message)}finally{if(btn){btn.disabled=false;btn.textContent='重试失败项'}}}
+async function retryJob(){if(!currentJob)return;await retryHistoryJob(currentJob,$('retryJob'))}
+async function deleteHistoryJob(id){if(!confirm('确认删除这条历史记录和已生成的下载文件？'))return;const r=await fetch('/api/jobs/'+encodeURIComponent(id),{method:'DELETE'});const d=await r.json().catch(()=>({}));if(!r.ok){alert(d.error||'删除失败');return}if(currentJob===id){currentJob=null;$('jobId').textContent='未开始';setDownloads();setLogText('');updateTaskSummary({status:'-'});updateMetrics({status:'-',done:0,total:0,ok:0,failed:0});renderLedger([])}loadHistory()}
+function openHistoryJob(id){currentJob=id;$('jobId').textContent='改密/2FA '+currentJob;if(timer)clearInterval(timer);timer=setInterval(poll,1500);poll()}
+async function loadHistory(){const r=await fetch('/api/history',{cache:'no-store'});if(r.status===401)return;const d=await r.json();const box=$('history');box.innerHTML='';const items=(d.items||[]).filter(x=>x.kind==='change_password');box.style.display=items.length?'grid':'none';const empty=$('historyEmpty');if(empty)empty.style.display=items.length?'none':'block';if(!currentJob&&items.length){const selected=items.find(x=>['queued','running'].includes(x.status))||items[0];currentJob=selected.id;$('jobId').textContent='改密/2FA '+currentJob;setBusy(['queued','running'].includes(selected.status));if(timer)clearInterval(timer);timer=setInterval(poll,1500);poll()}items.forEach(x=>{const links=[`<button class="secondary" type="button" onclick="openHistoryJob('${escapeHtml(x.id)}')">查看任务</button>`];if(x.combinedCredentialsDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/combined-credentials/download">下载账密 MFA（合并）</a>`);if(x.accountsPwDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/accounts-passwords/download">下载账号密码</a>`);if(x.passwordLedgerDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/password-ledger/download">下载密码台账</a>`);if(x.securityChangesDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/security-changes/download">下载改密MFA汇总</a>`);if(x.mfaSecretsDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/mfa-secrets/download">下载 MFA</a>`);if(x.logDownloadReady)links.push(`<a class="button secondary" href="/api/jobs/${x.id}/logs/download">下载日志</a>`);if(!['queued','running'].includes(x.status)&&Number(x.retryableCount||0)>0){links.push(`<button class="secondary" type="button" onclick="openFailedAccountsModal('${escapeHtml(x.id)}')">查看失败账号 (${escapeHtml(x.retryableCount)})</button>`);links.push(`<button class="secondary" type="button" onclick="retryHistoryJob('${escapeHtml(x.id)}',this)">重试失败项 (${escapeHtml(x.retryableCount)})</button>`)}if(!['queued','running'].includes(x.status))links.push(`<button class="danger" type="button" onclick="deleteHistoryJob('${escapeHtml(x.id)}')">删除记录</button>`);const cls=x.status==='finished'||(x.status==='failed'&&Number(x.ok||0)>0)?'ok':(x.status==='failed'?'fail':(x.status==='stopped'?'fail':'run'));const progress=x.status==='running'||x.status==='queued'?` · ${escapeHtml(x.done||0)}/${escapeHtml(x.total||0)}`:'';const card=document.createElement('div');card.className='history-card';card.innerHTML=`<div><div class="history-id">${escapeHtml(x.id)}</div></div><div><span class="badge ${cls}">${escapeHtml(displayStatus(x))}${progress}</span><div class="history-meta">成功 ${escapeHtml(x.ok)} / 失败 ${escapeHtml(x.failed)} · 剩余 ${escapeHtml(formatCountdown(x.expiresIn))}</div></div><details class="actions-menu"><summary>操作</summary><div class="actions-pop">${links.join(' ')}</div></details>`;box.appendChild(card)})}
+function bindPanelLabels(){document.querySelectorAll('.data-panel').forEach(panel=>{const label=panel.querySelector('.summary-action span');if(!label)return;const sync=()=>{label.textContent=panel.open?'点击收起':'点击展开'};panel.addEventListener('toggle',sync);sync()})}
+function updatePasswordMode(){const clean=cleanMfaOnlyChecked();const pw=$('changePasswordOpt'),mfa=$('changeMfaOpt');if(pw){pw.disabled=clean;if(clean)pw.checked=false}if(mfa){mfa.disabled=clean;if(clean)mfa.checked=false}const show=!clean&&changePasswordChecked();const box=$('passwordSettings');if(box)box.style.display=show?'block':'none';const fixed=($('passwordMode')&&$('passwordMode').value)==='fixed';const row=$('fixedPasswordRow');if(row)row.style.display=(show&&fixed)?'block':'none'}
+function updateLoginMode(){
+  const mode=loginModeValue(),needsStartUrl=mode==='idc';
+  const row=$('startUrlRow');if(row)row.style.display=needsStartUrl?'block':'none';
+  const pvBox=$('pvUrlBox');if(pvBox)pvBox.style.display=needsStartUrl?'':'none';
+  const hint=$('loginModeHint');
+  if(hint)hint.textContent=mode==='student'
+    ?'学生号无需 Start URL。每行 邮箱|Outlook密码|AWS密码，可选 MFA。改密改的是 AWS 密码。'
+    :(mode==='github'
+      ?'GitHub 无需 Start URL。每行 GitHub 邮箱或用户名|GitHub 密码|已有 TOTP 密钥（可选）。'
+      :'IDC 需要 Start URL，或每行自带 login_url。');
+  const genericPlaceholder=mode==='github'
+    ?'每行一个 GitHub 个人号：\nuser@example.com|GitHubPassword123\nuser@example.com----GitHubPassword123----TOTPSECRET'
+    :'每行一个账号：\nuser@example.com|Password123\nuser@example.com----Password123----MFASECRET';
+  if($('accounts'))$('accounts').placeholder=genericPlaceholder;
+  const isStudent=mode==='student';
+  const genericBox=$('accounts'),studentBox=$('studentAccounts'),studentGuide=$('studentFieldGuide'),studentHint=$('studentHint'),accountMode=$('accountMode');
+  if(genericBox)genericBox.style.display=isStudent?'none':'block';
+  if(studentBox)studentBox.style.display=isStudent?'block':'none';
+  if(studentGuide)studentGuide.style.display=isStudent?'grid':'none';
+  if(studentHint)studentHint.style.display=isStudent?'block':'none';
+  if(accountMode&&!isStudent&&(accountMode.value==='student'||accountMode.value==='standard'))accountMode.value='auto';
+  updateAccountMode();updateParsePreview();
+}
+function updateAccountMode(){const el=$('accountMode'),hint=$('fixedHint'),studentFixed=$('studentFixedHint');if(!el)return;const student=loginModeValue()==='student';if(hint)hint.style.display=(!student&&el.value==='fixed')?'block':'none';if(studentFixed)studentFixed.style.display=(student&&el.value==='fixed')?'block':'none'}
+function onAccountModeChange(){const el=$('accountMode');if(el&&(el.value==='student'||el.value==='standard')&&loginModeValue()!=='student'&&$('loginMode')){$('loginMode').value='student';updateLoginMode();el.value=el.value;updateAccountMode();updateParsePreview();return}updateAccountMode();updateParsePreview()}
+async function copyPlainText(text){const value=String(text??'');if(!value)return false;try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(value);return true}}catch(e){}const helper=document.createElement('textarea');helper.value=value;helper.setAttribute('readonly','');helper.style.position='fixed';helper.style.opacity='0';document.body.appendChild(helper);helper.select();let ok=false;try{ok=document.execCommand('copy')}catch(e){}helper.remove();return ok}
+function recoveredFieldHtml(label,value){return`<div class="credential-field"><label>${escapeHtml(label)}</label><input readonly value="${escapeHtml(value||'-')}" title="${escapeHtml(value||'-')}"></div>`}
+function renderFailedAccounts(){const box=$('failedAccountsList');if(!box)return;const rows=failedCredentialRows||[];if(!rows.length){box.innerHTML='<div class="credential-empty">没有可回填的失败账号。</div>';return}box.innerHTML=rows.map((row,index)=>{const student=(row.loginMode||failedCredentialPayload?.loginMode)==='student';const fields=student?[['PASS MAIL',row.mailPassword],['PASS AWS',row.password],['2FA',row.mfaSecret],['代理',row.proxy]]:[['密码',row.password],['2FA',row.mfaSecret],['代理',row.proxy],['Start URL',row.startUrl]];return`<article class="credential-row"><div class="credential-row-head"><div class="credential-row-title">#${escapeHtml(row.idx)} <code>${escapeHtml(row.email)}</code></div><span class="row-status fail">失败/未完成</span></div><div class="credential-error">报错：${escapeHtml(row.message||'失败')}</div><div class="credential-fields">${fields.filter(([,value])=>student||value).map(([label,value])=>recoveredFieldHtml(label,value)).join('')}</div><span class="credential-line-label">当前系统可直接使用的账号格式</span><textarea class="credential-line" readonly>${escapeHtml(row.input||'')}</textarea><div class="credential-row-actions"><button class="secondary" type="button" data-credential-copy="${index}" style="min-height:26px;padding:4px 8px;font-size:10px">复制此账号</button><button class="primary" type="button" data-credential-fill="${index}" style="min-height:26px;padding:4px 8px;font-size:10px">回填此账号</button></div></article>`}).join('')}
+function closeFailedAccountsModal(){const modal=$('failedAccountsModal');if(modal){modal.classList.remove('show');modal.setAttribute('aria-hidden','true')}}
+async function openFailedAccountsModal(jobId){const modal=$('failedAccountsModal'),meta=$('failedAccountsModalMeta'),box=$('failedAccountsList'),err=$('failedAccountsModalError');if(!modal)return;failedCredentialPayload=null;failedCredentialRows=[];if(meta)meta.textContent='加载中...';if(err){err.textContent='';err.style.display='none'}if(box)box.innerHTML='<div class="credential-empty">正在加载失败账号...</div>';modal.classList.add('show');modal.setAttribute('aria-hidden','false');try{const r=await fetch('/api/jobs/'+encodeURIComponent(jobId)+'/failed-accounts',{cache:'no-store'});if(r.status===401){location.href='/login';return}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'加载失败账号失败');failedCredentialPayload=d;failedCredentialRows=d.rows||[];if(meta)meta.textContent=`任务 ${jobId} · ${d.count||0} 个失败/未完成账号。`;renderFailedAccounts()}catch(e){if(meta)meta.textContent='无法加载失败账号';if(err){err.textContent=e.message;err.style.display='block'}if(box)box.innerHTML='<div class="credential-empty">没有加载到凭据。</div>'}}
+function fillRecoveredAccounts(rows){const selected=(rows||[]).filter(Boolean);if(!selected.length)return;const payloadData=failedCredentialPayload||{};let mode=String(payloadData.loginMode||selected[0].loginMode||'idc').toLowerCase();if(['builder-id','builder_id','builderid'].includes(mode))mode='student';const target=mode==='student'?$('studentAccounts'):$('accounts'),other=mode==='student'?$('accounts'):$('studentAccounts');if(!target)return;const existing=((target.value||'').trim()||(other&&other.value||'').trim());if(existing&&!confirm('当前账号输入框已有内容，确认用失败账号凭据替换吗？'))return;$('loginMode').value=mode;updateLoginMode();$('accountMode').value=mode==='student'?'student':'auto';updateAccountMode();target.value=selected.map(row=>row.input||'').filter(Boolean).join('\n');if(other)other.value='';if(mode==='idc'&&$('startUrl'))$('startUrl').value=payloadData.startUrl||selected[0].startUrl||'';updateParsePreview();setLogText(`已回填 ${selected.length} 个失败账号到输入框。`);closeFailedAccountsModal();setTimeout(()=>target.focus(),30)}
+async function copyFailedAccounts(button){const text=failedCredentialPayload?.inputText||failedCredentialRows.map(row=>row.input||'').filter(Boolean).join('\n');if(!text)return;const ok=await copyPlainText(text);if(button){const old=button.textContent;button.textContent=ok?'已复制全部':'复制失败';setTimeout(()=>{button.textContent=old},1400)}}
+async function copyRecoveredAccount(index,button){const row=failedCredentialRows[index];if(!row)return;const ok=await copyPlainText(row.input||'');if(button){const old=button.textContent;button.textContent=ok?'已复制':'复制失败';setTimeout(()=>{button.textContent=old},1400)}}
+async function loadProxyPool(){try{const r=await fetch('/api/proxy-pool',{cache:'no-store'});if(!r.ok)return;const d=await r.json();if(d&&typeof d.proxyPool==='string'&&d.proxyPool){if($('proxyPool')&&!$('proxyPool').value.trim())$('proxyPool').value=d.proxyPool;if($('saveProxyPool'))$('saveProxyPool').checked=true;const msg=$('proxyPoolMsg');if(msg&&d.count)msg.textContent='已加载已保存的 '+d.count+' 个代理'}}catch(e){}}
+async function saveProxyPoolNow(){const btn=$('btnSaveProxyPool'),msg=$('proxyPoolMsg');const text=($('proxyPool')&&$('proxyPool').value)||'';if(btn)btn.disabled=true;if(msg)msg.textContent='保存中...';try{const r=await fetch('/api/proxy-pool',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxyPool:text})});if(r.status===401){location.href='/login';return}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'保存失败');if($('saveProxyPool'))$('saveProxyPool').checked=true;if(msg)msg.textContent='已保存 '+(d.count||0)+' 个代理'}catch(e){if(msg)msg.textContent='保存失败：'+e.message}finally{if(btn)btn.disabled=false}}
+function bindLogFilters(){document.querySelectorAll('#logFilters button').forEach(btn=>btn.addEventListener('click',()=>{currentLogFilter=btn.dataset.filter||'all';document.querySelectorAll('#logFilters button').forEach(x=>x.classList.toggle('active',x===btn));renderFilteredLogs()}))}
+$('start').addEventListener('click',e=>{e.preventDefault();startJob()});
+$('stopJob').addEventListener('click',e=>{e.preventDefault();stopJob()});
+$('retryJob').addEventListener('click',e=>{e.preventDefault();retryJob()});
+$('passwordMode').addEventListener('change',updatePasswordMode);
+$('changePasswordOpt').addEventListener('change',updatePasswordMode);
+$('changeMfaOpt').addEventListener('change',updatePasswordMode);
+$('cleanMfaOnlyOpt').addEventListener('change',updatePasswordMode);
+$('loginMode').addEventListener('change',updateLoginMode);
+$('accountMode').addEventListener('change',onAccountModeChange);
+$('accounts').addEventListener('input',updateParsePreview);
+if($('studentAccounts'))$('studentAccounts').addEventListener('input',updateParsePreview);
+$('startUrl').addEventListener('input',updateParsePreview);
+const _spp=$('btnSaveProxyPool');if(_spp)_spp.addEventListener('click',e=>{e.preventDefault();saveProxyPoolNow()});
+bindPanelLabels();bindLogFilters();updatePasswordMode();updateAccountMode();updateLoginMode();updateParsePreview();loadHistory();setInterval(loadHistory,15000);loadProxyPool();
+const _failedClose=$('failedAccountsModalClose'),_failedModal=$('failedAccountsModal'),_failedCopy=$('copyFailedAccounts'),_failedFill=$('fillFailedAccounts'),_failedList=$('failedAccountsList');
+if(_failedClose)_failedClose.addEventListener('click',closeFailedAccountsModal);
+if(_failedModal)_failedModal.addEventListener('click',e=>{if(e.target===_failedModal)closeFailedAccountsModal()});
+if(_failedCopy)_failedCopy.addEventListener('click',()=>copyFailedAccounts(_failedCopy));
+if(_failedFill)_failedFill.addEventListener('click',()=>fillRecoveredAccounts(failedCredentialRows));
+if(_failedList)_failedList.addEventListener('click',e=>{const copy=e.target.closest('[data-credential-copy]'),fill=e.target.closest('[data-credential-fill]');if(copy)copyRecoveredAccount(Number(copy.dataset.credentialCopy),copy);if(fill)fillRecoveredAccounts([failedCredentialRows[Number(fill.dataset.credentialFill)]])});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeFailedAccountsModal()});
+</script>
+</body>
+</html>

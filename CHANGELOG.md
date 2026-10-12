@@ -2,6 +2,71 @@
 
 本项目所有值得记录的变更都写在这里。版本遵循语义化版本 `MAJOR.MINOR.PATCH`。
 
+## [Unreleased]
+
+### 新增
+
+- **登录后改密 / 2FA 独立页**：改密和改 2FA 从获取 JSON 工作台拆到 `/security`。可单独勾选「修改密码」或「设置/更换 2FA」，也可两项一起改。密码模式（每号随机 / 固定密码）在改密页直接设置，只改 2FA 时不必填新密码。账号解析、代理池、并发、超时、任务控制台复用原有逻辑。接口仍是 `POST /api/change-password`。
+- **GitHub 个人号改密 / 2FA**：仅在独立 `/security` 页面增加 GitHub 登录方式。任务直接登录 `github.com`，支持修改 GitHub 密码、按官方 Password and authentication 页面更换 Authenticator app，并即时保存新 TOTP secret；获取 JSON 页面保持不变。
+- **改密先落盘再改状态**：生成目标新密码后立刻写入 `kiro-password-ledger-{jobId}.json` 和 `kiro-changed-passwords-{jobId}.txt`（status=pending），站点接受后再标 applied，任务成功/失败后再更新状态。即使后续步骤报错，新密码也不会丢。页面可下载「账号密码」和「密码台账」。
+- **更换 2FA 会删除旧设备**：Builder ID「Register device」是新增 authenticator，不会替换已有设备。现会在绑定成功并点 Done 后，选中更换前的 MFA 设备再 Delete。删失败时任务失败，新密钥仍落盘。`removeOldMfa` 可在不注册新设备的情况下只删掉除最新一台以外的 MFA。
+
+### 修复
+
+- **学生号 Security 页被误当成改密表单**：资料页 Signed in devices 文案含 “change your password”，旧逻辑没等弹窗打开就去填 New password。现只在改密 dialog / 密码输入框真正出现时才填表，并会先点 Authentication 的 Change password。
+- **学生号资料页改密误判未登录**：Builder ID 登录后资料页「My details」含 Email address，旧逻辑把任意可见输入当成邮箱登录页并立刻失败；点侧栏 Security 触发二次密码/2FA 时也不会填写。现仅在 Get started 页判定邮箱登录，登录后等到资料页再改密，侧栏精确点 Security，并处理二次验证。
+- **账号解析不再被学生号 TYPE 块独占**：默认回到自动识别。`|` 与 `----` 对 IDC / M365 / Google / GitHub / 学生号都继续有效。学生号 TYPE / LOGIN / MAIL_PASSWORD / PASSWORD 块只从带 `TYPE:` 的段落里取，可与分隔符行混贴、互不抢行。
+- **获取 JSON 登录路径不被改密任务提前掐掉**：IDC / 学生号 JSON 登录仍等到总超时和 Allow access。密码提交后的短超时、资料页标记、跳过 Allow access 只在「登录后改密」任务生效。IDC 首次登录改密提交按钮与原先一致。
+- **本机 mihomo 时浏览器真正走本地出口**：配了控制器后，任务会改走 `KIRO_MIHOMO_PROBE_PROXY`（默认 `127.0.0.1:7895`）。原先即使用户代理池只有 1 个 IP，切节点也不会作用到 Playwright。
+- **未生效的预写新密码不再拿去登录**：重试/失败账号回填只使用台账里 `applied` 的密码。写盘但站点未接受的 pending 密码不会覆盖当前登录密码。
+- **粘贴旧密码时自动改用历史上已生效的密码**：提交任务时按密码台账复用最近一次站点已接受的密码，避免改密成功后再用原密码登录。
+- **Builder ID 密码不匹配不再当成 captcha**：没有 Security check 时，`doesn't quite match our records` 按密码错误失败，不再换 IP 连点 Continue。有 Security check / Invalid captcha 时仍换出口重试。
+
+## [1.0.13] - 2026-09-28
+
+### 修复
+
+- **Builder ID Security check 被误当成密码错误**：AWS Builder ID 密码页弹出 `Security check` / Arkose 人机验证时，原先会反复点 Continue，最终报 `doesn't quite match our records`。现识别为 captcha 并走代理池/mihomo 换 IP 重试。
+
+## [1.0.12] - 2026-09-28
+
+### 新增
+
+- **代理格式 `ip:port:username:password`**：代理池和账号行里的代理支持 `1.2.3.4:8080:user:pass`（以及 `user:pass:host:port`）。会规范成 `http://user:pass@host:port`，Playwright 启动时把账密拆到 `username` / `password`，不再把整串塞进 `server`。
+
+## [1.0.11] - 2026-09-24
+
+### 新增
+
+- **学生号专用输入框**：登录方式移到账号导入第一步。选「Kiro 学生号」后，输入框切换为 MAIL / PASS MAIL / PASS AWS 格式，并显示字段说明与 Outlook/AWS 密码预览。账号格式下拉新增「学生号格式」，选中后自动切到学生号登录。
+
+## [1.0.10] - 2026-09-24
+
+### 新增
+
+- **Kiro 学生号登录**：AWS Builder ID 设备码 + 大学 Outlook 邮箱验证码。登录方式选「Kiro 学生号」，无需 Start URL。账号格式：
+
+  ```text
+  MAIL: student@university.edu
+  PASS MAIL: Outlook邮箱密码
+  PASS AWS: AWS Builder ID密码
+  ```
+
+  `MAIL` 同时是 Builder ID 账号和 Outlook 邮箱。后端用 Graph 读 `no-reply@login.awsapps.com` 的 6 位验证码，走 Get started → 密码 → 邮箱 OTP → Confirm and continue → Allow access。
+
+## [1.0.9] - 2026-09-22
+
+### 新增
+
+- **四横线 `----` 作为通用分隔符**：`----` 只负责切字段，不固定为 mail/password/2fa。各段按内容识别 Start URL（含 `idc::`）、region、代理、TOTP 密钥，剩下的按顺序取账号和密码。可与 `email:password`、管道、标签块等混贴，按行识别、互不抢行。三横线 `---` 仍可作为分隔符，但不会切开 `email:password` 里密码中的 `---`。
+
+## [1.0.8] - 2026-09-22
+
+### 修复
+
+- **Google 个人号「身份异常 / JavaScript 已关闭」**：Playwright Chromium 会被 Google 判定为无 JS 自动化浏览器（`accounts.google.com/signin/rejected`），日志误报成「账号不存在或被封」。Gmail / GitHub 个人号改为默认使用 Camoufox（Xvfb 虚拟显示 + Windows 指纹 + 拟人输入），启动失败时回退 Playwright Firefox。
+- **社交登录撞 reCAPTCHA 可换 IP 重试**：与 IDC 路径一致，Google/GitHub 人机验证或代理失败时走 mihomo / 代理池换出口。
+
 ## [1.0.7] - 2026-07-11
 
 ### 新增

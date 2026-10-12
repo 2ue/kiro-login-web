@@ -5,8 +5,9 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/root/.openclaw/workspace/kiro-login-web
-Environment=KIRO_LOGIN_HOST=127.0.0.1
+Environment=KIRO_LOGIN_HOST=0.0.0.0
 Environment=KIRO_LOGIN_PORT=7888
+Environment=KIRO_LOGIN_COOKIE_SECURE=auto
 ExecStart=/root/.openclaw/workspace/kiro-login-web/run.sh
 Restart=always
 RestartSec=5

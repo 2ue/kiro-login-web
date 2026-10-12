@@ -132,7 +132,9 @@ def _oidc_base(region: str) -> str:
 def derive_from_start_url(start_url: str) -> tuple[str, str]:
     """从 start_url 提取 (region, issuer_url)。
 
-    支持新版 SSO Portal URL：https://ssoins-XXXX.portal.<region>.app.aws[/...]
+    支持新版 SSO Portal URL：
+      https://ssoins-XXXX.portal.<region>.app.aws[/...]
+      https://ssoins-XXXX.<region>.portal.amazonaws.com[/...]
       -> region = <region>；issuer_url = https://identitycenter.amazonaws.com/ssoins-XXXX
     老版 d-xxx.awsapps.com/start 无法从 URL 直接拿到实例 ID，返回空值（由调用方回退默认）。
     返回 (region, issuer_url)，拿不到的部分为 ""。
@@ -147,6 +149,13 @@ def derive_from_start_url(start_url: str) -> tuple[str, str]:
     host = host.lower()
     # 新版：ssoins-XXXX.portal.<region>.app.aws
     m = re.match(r"^(ssoins-[0-9a-f]+)\.portal\.([a-z0-9-]+)\.app\.aws$", host)
+    if m:
+        instance_id = m.group(1)
+        region = m.group(2)
+        issuer_url = f"https://identitycenter.amazonaws.com/{instance_id}"
+        return region, issuer_url
+    # Portal AmazonAWS：ssoins-XXXX.<region>.portal.amazonaws.com
+    m = re.match(r"^(ssoins-[0-9a-f]+)\.([a-z0-9-]+)\.portal\.amazonaws\.com$", host)
     if m:
         instance_id = m.group(1)
         region = m.group(2)
@@ -312,7 +321,7 @@ def register_and_start(
             hint = (f" (Go y: OIDC region phai trung IAM Identity Center — "
                     f"thu {DEFAULT_OIDC_REGION} o muc 'OIDC region (login IAM)')")
         elif da_status == 400:
-            hint = " (Kiem tra IDC start URL co dung d-xxx.awsapps.com/start khong)"
+            hint = " (Kiem tra IDC start URL co dung AWS access portal/SSO portal URL khong)"
         return DeviceAuthStart(
             ok=False,
             error=f"DeviceAuthorization that bai (HTTP {da_status}): "
@@ -343,6 +352,7 @@ def poll_for_token(
     fetch_profile: bool = True,
     stop_event=None,
     log: Callable[[str], None] = print,
+    timeout_s: int | None = None,
 ) -> DurableExport:
     """Buoc 3+4: poll CreateToken den khi user login xong, roi lay profileArn.
 
@@ -351,10 +361,17 @@ def poll_for_token(
     oidc_region = start.oidc_region
     kiro_region = start.kiro_region
     token_url = _oidc_base(oidc_region) + "/token"
-    deadline = time.time() + start.expires_in
+    device_code_ttl = max(1, int(start.expires_in or 600))
+    if timeout_s is not None and int(timeout_s or 0) > 0:
+        wait_seconds = min(device_code_ttl, max(1, int(timeout_s)))
+    else:
+        wait_seconds = device_code_ttl
+    deadline = time.time() + wait_seconds
     interval = max(2, start.interval)
 
-    log("device-code: cho ban login browser & dang poll token ...")
+    log(f"device-code: cho ban login browser & dang poll token ...（最多等待 {wait_seconds} 秒）")
+    if wait_seconds < device_code_ttl:
+        log(f"device-code: 本地 token 等待上限 {wait_seconds} 秒（AWS device code 有效期约 {device_code_ttl} 秒）")
     access_token = refresh_token = ""
     expires_in = 0
     last_pending_log = 0.0
@@ -382,12 +399,20 @@ def poll_for_token(
                 remain = max(0, int(deadline - now))
                 log(f"device-code: token 还未授权，继续等待（剩余约 {remain} 秒）")
                 last_pending_log = now
-            time.sleep(interval)
+            sleep_for = min(interval, max(0.0, deadline - time.time()))
+            if sleep_for <= 0:
+                break
+            if stop_event is not None:
+                stop_event.wait(timeout=sleep_for)
+            else:
+                time.sleep(sleep_for)
             continue
         # loi that su
         return DurableExport(
             error=f"CreateToken loi: {err} - {tok.get('error_description') or tok}")
     if not access_token:
+        if wait_seconds < device_code_ttl:
+            return DurableExport(error=f"等待授权 token 超时（{wait_seconds} 秒内未收到 token）")
         return DurableExport(error="Het han cho login (khong nhan duoc token).")
 
     now = dt.datetime.now(dt.timezone.utc)

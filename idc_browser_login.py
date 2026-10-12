@@ -27,11 +27,12 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 import mfa_totp
+from proxy_util import playwright_proxy
 
 
 # Mac dinh
 DEFAULT_IDC_START_URL = "https://d-9066713dd7.awsapps.com/start"
-DEFAULT_NEW_PASSWORD = "Kiro@Durable2026#"   # du manh cho policy AWS (>=8, hoa/thuong/so/ky tu)
+DEFAULT_NEW_PASSWORD = "Kiro@TJ3QbKeN6QB5L5oEYk#"   # du manh cho policy AWS (>=8, hoa/thuong/so/ky tu)
 
 # Text marker (lowercase) de nhan dien trang thai
 INCORRECT_MARKERS = (
@@ -58,6 +59,22 @@ MFA_VERIFY_MARKERS = (
     "enter the 6 digit code", "six digit code from your authenticator",
     "code from your authenticator app", "troubleshoot mfa",
 )
+# 门户/资料页绑定或更换 2FA 成功后的文案。设置页常仍留着 “multi-factor” 标题，
+# 不能再把 MFA_MARKERS 当成「还在绑定页」。
+MFA_SETTINGS_SUCCESS_MARKERS = (
+    "mfa device assigned",
+    "successfully assigned",
+    "authenticator app added",
+    "mfa device added",
+    "registered successfully",
+    "device registered",
+    "successfully registered",
+    "successfully added",
+    "mfa has been assigned",
+    "assigned mfa",
+    "mfa device is assigned",
+    "your authenticator app is ready",
+)
 SUCCESS_MARKERS = (
     "request approved", "approved", "you can close", "added to your devices",
     "you may close", "request was approved",
@@ -83,6 +100,7 @@ class LoginOutcome:
     changed_password: bool = False
     error: str = ""
     mfa_secret: str = ""   # 若本次登录绑定了新 MFA，这里返回 AWS 生成的 TOTP 密钥（供回写保存）
+    changed_mfa: bool = False
 
 
 @dataclass
@@ -135,7 +153,7 @@ def _read_txt(p: Path) -> List[AccountRow]:
             continue
         # BO comment ket qua tool tu ghi-back ("   # OK/LOGIN FAIL ...").
         # Dung pattern ">=2 khoang trang + #" -> KHONG dung cham vao '#' trong password
-        # (vd "Kiro@Durable2026#" giu nguyen vi khong co khoang trang truoc '#').
+        # (vd "Kiro@TJ3QbKeN6QB5L5oEYk#" giu nguyen vi khong co khoang trang truoc '#').
         line = re.split(r"\s{2,}#", line, maxsplit=1)[0].rstrip()
         if not line:
             continue
@@ -284,31 +302,94 @@ def _click_button(page, texts, log, timeout=2500) -> bool:
     return False
 
 
+def _click_visible_label(page, texts, log, timeout=2500) -> bool:
+    """Click a visible button, link, tab, or menu item whose label matches."""
+    if _click_button(page, texts, log, timeout=timeout):
+        return True
+    for t in texts:
+        makers = (
+            page.get_by_role("link", name=t, exact=True),
+            page.get_by_role("link", name=t),
+            page.get_by_role("menuitem", name=t),
+            page.get_by_role("tab", name=t),
+            page.locator(f'a:has-text("{t}")'),
+            page.locator(f'[role=menuitem]:has-text("{t}")'),
+            page.locator(f'[role=tab]:has-text("{t}")'),
+            page.locator(f'[role=option]:has-text("{t}")'),
+        )
+        for mk in makers:
+            try:
+                el = mk.first
+                if el.count() and el.is_visible():
+                    el.click(timeout=timeout)
+                    log(f"    -> click '{t}'")
+                    return True
+            except Exception:
+                pass
+    for t in texts:
+        try:
+            el = page.get_by_text(t, exact=False).first
+            if el.count() and el.is_visible():
+                el.click(timeout=timeout)
+                log(f"    -> click '{t}'")
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _native_set_value(loc, value: str) -> None:
+    loc.evaluate(
+        """(node, v) => {
+            const proto = node instanceof HTMLInputElement
+                ? window.HTMLInputElement.prototype
+                : window.HTMLTextAreaElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) desc.set.call(node, v);
+            else node.value = v;
+            node.dispatchEvent(new Event('input', { bubbles: true }));
+            node.dispatchEvent(new Event('change', { bubbles: true }));
+        }""",
+        value,
+    )
+
+
 def _fill_first_visible(page, selector: str, value: str, timeout=15000) -> bool:
     """Dien + VERIFY gia tri da vao field (chong race khi chay da luong)."""
     try:
         loc = page.locator(f"{selector} >> visible=true").first
         loc.wait_for(state="visible", timeout=timeout)
-        loc.click(timeout=4000)
+        try:
+            loc.click(timeout=4000)
+        except Exception:
+            pass
         try:
             loc.fill("")
         except Exception:
             pass
-        loc.fill(value)
-        # verify: cho chac field nhan dung gia tri truoc khi submit
-        for _ in range(2):
+        try:
+            loc.fill(value)
+        except Exception:
+            pass
+        def _got() -> str:
             try:
-                if (loc.input_value() or "") == value:
-                    break
+                return loc.input_value() or ""
             except Exception:
-                break
+                return ""
+        if _got() != value:
             try:
-                loc.fill(value)
+                _native_set_value(loc, value)
             except Exception:
                 pass
-            time.sleep(0.1)
+        if _got() != value:
+            try:
+                loc.press("Control+A")
+                loc.press("Backspace")
+                loc.press_sequentially(value, delay=20)
+            except Exception:
+                pass
         time.sleep(0.25)  # settle cho SPA dang ky onChange
-        return True
+        return _got() == value or bool(_got())
     except Exception:
         return False
 
@@ -318,17 +399,64 @@ def _fill_nth_password(page, idx: int, value: str) -> None:
     try:
         loc = page.locator("input[type=password] >> visible=true").nth(idx)
         loc.click(timeout=3000)
-        loc.fill(value)
-        for _ in range(2):
-            try:
-                if (loc.input_value() or "") == value:
-                    break
-            except Exception:
-                break
+        try:
             loc.fill(value)
-            time.sleep(0.1)
+        except Exception:
+            pass
+        try:
+            current = loc.input_value() or ""
+        except Exception:
+            current = ""
+        if current != value:
+            try:
+                _native_set_value(loc, value)
+            except Exception:
+                pass
     except Exception:
         pass
+
+
+# Keep this list identical to the historical JSON first-login change-password
+# submit buttons. Extra labels belong only on the post-login profile/portal form.
+PASSWORD_CHANGE_SUBMIT_TEXTS = [
+    "Confirm", "Change password", "Update password", "Set new password",
+    "Set password", "Save changes", "Save", "Continue", "Submit",
+]
+PASSWORD_CHANGE_SUBMIT_TEXTS_EXTRA = [
+    "Update", "Apply",
+]
+
+
+def fill_and_submit_password_form(
+    page,
+    current_password: str,
+    new_password: str,
+    log,
+    extra_submit_texts=None,
+) -> bool:
+    """Fill a 2- or 3-field password form (current/new/confirm or new/confirm) and submit."""
+    pw_n = _count_visible(page, "input[type=password]")
+    if pw_n < 2:
+        return False
+    if pw_n >= 3:
+        _fill_nth_password(page, 0, current_password)
+        _fill_nth_password(page, 1, new_password)
+        _fill_nth_password(page, 2, new_password)
+    else:
+        _fill_nth_password(page, 0, new_password)
+        _fill_nth_password(page, 1, new_password)
+    time.sleep(0.3)
+    _wait_metadata1(page)
+    texts = list(PASSWORD_CHANGE_SUBMIT_TEXTS)
+    if extra_submit_texts:
+        texts.extend(extra_submit_texts)
+    clicked = _click_button(page, texts, log)
+    if not clicked:
+        try:
+            page.keyboard.press("Enter")
+        except Exception:
+            pass
+    return True
 
 
 def _visible_error_text(page) -> str:
@@ -416,6 +544,7 @@ def drive_login(
     stop_event=None,
     proxy: str = "",
     timeout_s: int = 220,
+    failure_wait_s: int = 60,
     window_index: int = 0,
     window_count: int = 1,
     screen_w: int = 1920,
@@ -424,6 +553,9 @@ def drive_login(
     mfa_secret: str = "",
     on_secret=None,
     on_password_changed=None,
+    goal: str = "authorize",
+    do_change_password: bool = True,
+    do_change_mfa: bool = False,
 ) -> LoginOutcome:
     """Mo Chromium sach, tu login trang device-code den khi bam 'Allow access'.
 
@@ -454,9 +586,9 @@ def drive_login(
     if not headless:
         launch_args += _tile_args(window_index, window_count, screen_w, screen_h)
     launch_kwargs = {"headless": headless, "args": launch_args}
-    if proxy:
-        srv = proxy if "://" in proxy else f"http://{proxy}"
-        launch_kwargs["proxy"] = {"server": srv}
+    proxy_cfg = playwright_proxy(proxy)
+    if proxy_cfg:
+        launch_kwargs["proxy"] = proxy_cfg
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(**launch_kwargs)
@@ -474,9 +606,11 @@ def drive_login(
         page.set_default_timeout(15000)
         try:
             return _flow(page, verification_uri_complete, email, password,
-                         new_password, log, stop_event, timeout_s, debug_dir,
+                         new_password, log, stop_event, timeout_s, failure_wait_s, debug_dir,
                          known_mfa_secret=mfa_secret, on_secret=on_secret,
-                         on_password_changed=on_password_changed)
+                         on_password_changed=on_password_changed, goal=goal,
+                         do_change_password=do_change_password,
+                         do_change_mfa=do_change_mfa)
         except Exception as e:
             return LoginOutcome(False, error=f"loi browser: {e}")
         finally:
@@ -484,6 +618,72 @@ def drive_login(
                 browser.close()
             except Exception:
                 pass
+
+
+def drive_change_password(
+    start_url: str,
+    email: str,
+    password: str,
+    new_password: str = DEFAULT_NEW_PASSWORD,
+    log: Callable[[str], None] = print,
+    headless: bool = True,
+    stop_event=None,
+    proxy: str = "",
+    timeout_s: int = 220,
+    failure_wait_s: int = 60,
+    window_index: int = 0,
+    window_count: int = 1,
+    screen_w: int = 1920,
+    screen_h: int = 1040,
+    debug_dir: str = "",
+    mfa_secret: str = "",
+    on_secret=None,
+    on_password_changed=None,
+    do_change_password: bool = True,
+    do_change_mfa: bool = False,
+) -> LoginOutcome:
+    """Log in to the IDC access portal, then change password and/or 2FA.
+
+    Separate from JSON/token collection: opens ``start_url`` instead of the
+    device-code authorize URL, reuses the same username/password/MFA interaction.
+    """
+    if not do_change_password and not do_change_mfa:
+        return LoginOutcome(False, error="未选择要修改的项（密码或 2FA）")
+    if do_change_password:
+        if not new_password:
+            return LoginOutcome(False, error="未提供新密码")
+        if new_password == password:
+            return LoginOutcome(False, error="新密码与当前密码相同")
+    elif not new_password or new_password == password:
+        new_password = DEFAULT_NEW_PASSWORD
+        if new_password == password:
+            new_password = DEFAULT_NEW_PASSWORD + "9"
+    portal = (start_url or "").strip()
+    if not portal:
+        return LoginOutcome(False, error="IDC 改密需要 Start URL")
+    return drive_login(
+        portal,
+        email,
+        password,
+        new_password,
+        log=log,
+        headless=headless,
+        stop_event=stop_event,
+        proxy=proxy,
+        timeout_s=timeout_s,
+        failure_wait_s=failure_wait_s,
+        window_index=window_index,
+        window_count=window_count,
+        screen_w=screen_w,
+        screen_h=screen_h,
+        debug_dir=debug_dir,
+        mfa_secret=mfa_secret,
+        on_secret=on_secret,
+        on_password_changed=on_password_changed,
+        goal="change_password",
+        do_change_password=do_change_password,
+        do_change_mfa=do_change_mfa,
+    )
 
 
 # 验证码被 AWS 拒绝时页面常见的错误文案
@@ -495,7 +695,7 @@ MFA_REJECT_MARKERS = (
 
 
 def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
-                             on_secret=None) -> tuple[bool, str]:
+                             on_secret=None, settings_page: bool = False) -> tuple[bool, str]:
     """处理 AWS「绑定新 MFA」流程（身份验证程序 / authenticator app）。
 
     步骤：
@@ -569,6 +769,14 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
             return True
         if any(s in b for s in SUCCESS_MARKERS):
             return False
+        if settings_page and any(s in b for s in MFA_SETTINGS_SUCCESS_MARKERS):
+            return False
+        if settings_page:
+            try:
+                n = code_inputs().count()
+            except Exception:
+                n = 0
+            return any(m in b for m in MFA_REGISTER_MARKERS) or n > 0
         return any(m in b for m in MFA_MARKERS)
 
     def left_mfa_ok() -> bool:
@@ -579,8 +787,20 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
             b = ""
         if any(s in b for s in SUCCESS_MARKERS):
             return True
+        if settings_page and any(s in b for s in MFA_SETTINGS_SUCCESS_MARKERS):
+            return True
         if _is_button_visible(page, "Allow access") or _is_button_visible(page, "Confirm and continue"):
             return True
+        if settings_page:
+            # 设置页标题常仍含 multi-factor；抠到密钥后，注册特征/验证码框消失即视为成功。
+            try:
+                n = code_inputs().count()
+            except Exception:
+                n = 0
+            has_register = any(m in b for m in MFA_REGISTER_MARKERS)
+            if secret and not has_register and n == 0:
+                return True
+            return False
         return not any(m in b for m in MFA_MARKERS)
 
     secret = known_secret or ""
@@ -600,6 +820,20 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
         # 可能需要点 Next / Continue 进入密钥展示页
         _click_button(page, ["Next", "Continue", "下一步", "继续"], log, timeout=1500)
         page.wait_for_timeout(400)
+        for label in (
+            "Can't scan the QR code", "Can't scan", "Cannot scan",
+            "Enter key manually", "Show secret key", "显示密钥", "显示秘钥",
+            "无法扫描", "手动输入",
+        ):
+            try:
+                loc = page.get_by_text(label, exact=False)
+                if loc.count() > 0:
+                    loc.first.click(timeout=1500)
+                    log(f"    MFA: 展开密钥「{label}」")
+                    page.wait_for_timeout(400)
+                    break
+            except Exception:
+                pass
         shot("mfa_setup_page")
 
         # 2) 抠 secret key
@@ -659,7 +893,8 @@ def _handle_mfa_registration(page, log, _shot=None, known_secret: str = "",
             if left_mfa_ok():
                 log("    MFA: Enter 提交后已离开绑定页/出现授权页，绑定成功")
                 return True, secret
-        clicked = _click_button(page, ["Assign MFA", "Add MFA", "Register", "Confirm",
+        clicked = _click_button(page, ["Assign MFA", "Assign MFA device", "Add MFA",
+                                       "Add MFA device", "Add device", "Register", "Confirm",
                                        "Verify", "Submit", "Submit code", "Verify code",
                                        "Continue", "Next", "Done", "Finish",
                                        "绑定", "确认", "提交", "继续", "完成"], log)
@@ -990,8 +1225,10 @@ def _click_ms(page, selectors) -> bool:
 
 
 def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
+          failure_wait_s: int = 60,
           debug_dir: str = "", known_mfa_secret: str = "", on_secret=None,
-          on_password_changed=None) -> LoginOutcome:
+          on_password_changed=None, goal: str = "authorize",
+          do_change_password: bool = True, do_change_mfa: bool = False) -> LoginOutcome:
     safe = "".join(c if c.isalnum() else "_" for c in (email or "acc"))[:20]
     shot = {"i": 0}
 
@@ -1025,12 +1262,29 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
     user_attempts = 0
     idle_rounds = 0
     seen_password = False
+    post_password_idle_since = 0.0
     # 已绑定 MFA 的账号：用户提前提供 TOTP 密钥（base32），登录时直接用它算验证码。
     # 新账号首次绑定：留空，AWS 会展示密钥，由 _handle_mfa_registration 自动抠出来。
     mfa_secret = mfa_totp.normalize_secret(known_mfa_secret) if known_mfa_secret else ""
+    initial_mfa_secret = mfa_secret
     if mfa_secret:
         log(f"    MFA: 已注入预设密钥（{mfa_secret[:4]}…{mfa_secret[-4:]}），将用于 TOTP 验证")
     mfa_attempts = 0
+    bound_mfa_during_login = False
+
+    def _after_signed_in() -> LoginOutcome:
+        return _apply_idc_account_security(
+            page,
+            password if not changed else new_password,
+            new_password,
+            log, _shot, stop_event, deadline, on_password_changed, on_secret,
+            already_changed=changed,
+            mfa_secret=mfa_secret,
+            initial_mfa_secret=initial_mfa_secret,
+            bound_mfa_during_login=bound_mfa_during_login,
+            do_change_password=do_change_password,
+            do_change_mfa=do_change_mfa,
+        )
 
     while time.time() < deadline:
         if stop_event is not None and stop_event.is_set():
@@ -1053,6 +1307,7 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
             if st_ms == "left":
                 # 已跳回 AWS（同意页/success），交回主循环继续处理 Allow access
                 idle_rounds = 0
+                post_password_idle_since = 0.0
                 time.sleep(0.8)
                 continue
             if st_ms == "error":
@@ -1093,16 +1348,22 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                                                    on_secret=on_secret)
             if sec:
                 mfa_secret = sec
+                if sec != initial_mfa_secret:
+                    bound_mfa_during_login = True
             if not ok_mfa:
                 # 未抠到密钥或提交未被接受：稍等后主循环重新进入本分支重试
                 time.sleep(1.0)
                 continue
             idle_rounds = 0
+            post_password_idle_since = 0.0
             time.sleep(1.0)
             continue
 
         # --- da Allow xong / approved ---
         if any(m in body for m in SUCCESS_MARKERS):
+            if goal == "change_password":
+                log("    授权页已通过，改为在门户处理账号安全设置")
+                return _after_signed_in()
             log("    -> approved")
             return LoginOutcome(True, changed, mfa_secret=mfa_secret)
 
@@ -1113,16 +1374,30 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
 
         # --- consent: Allow access (cuoi cung) ---
         if has_allow:
+            if goal == "change_password":
+                log("    已出现授权页，登录完成，改为在门户处理账号安全设置")
+                return _after_signed_in()
             if _click_button(page, ["Allow access"], log):
                 time.sleep(0.8)
                 return LoginOutcome(True, changed, mfa_secret=mfa_secret)   # approve xong -> poll se lay token
 
         # --- consent: Confirm and continue (xac nhan user_code) ---
         if has_confirm:
+            if goal == "change_password":
+                log("    已进入授权确认，登录完成，改为在门户处理账号安全设置")
+                return _after_signed_in()
             _click_button(page, ["Confirm and continue"], log)
             idle_rounds = 0
+            post_password_idle_since = 0.0
             time.sleep(0.8)
             continue
+
+        if goal == "change_password" and seen_password and pw_n == 0 and not has_allow and not has_confirm:
+            if any(m in body for m in MFA_MARKERS):
+                pass
+            elif _is_idc_portal_home(page, body):
+                log("    已进入 IDC 门户，开始处理账号安全设置")
+                return _after_signed_in()
 
         # --- DOI MAT KHAU lan dau: >=2 o password ---
         if pw_n >= 2:
@@ -1135,27 +1410,7 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                     changed,
                     f"首次登录改密码失败：{detail or '页面未进入下一步'}",
                 )
-            if pw_n >= 3:
-                # current / new / confirm
-                _fill_nth_password(page, 0, password)
-                _fill_nth_password(page, 1, new_password)
-                _fill_nth_password(page, 2, new_password)
-            else:
-                _fill_nth_password(page, 0, new_password)
-                _fill_nth_password(page, 1, new_password)
-            time.sleep(0.3)
-            _wait_metadata1(page)
-            clicked = _click_button(
-                page,
-                ["Confirm", "Change password", "Update password", "Set new password",
-                 "Set password", "Save changes", "Save", "Continue", "Submit"],
-                log,
-            )
-            if not clicked:
-                try:
-                    page.keyboard.press("Enter")
-                except Exception:
-                    pass
+            fill_and_submit_password_form(page, password, new_password, log)
             idle_rounds = 0
             end = time.time() + 8.0
             while time.time() < end:
@@ -1187,6 +1442,7 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
                 except Exception:
                     pass
             time.sleep(0.5)
+            post_password_idle_since = 0.0
             continue
 
         # --- PASSWORD page: 1 o password ---
@@ -1216,20 +1472,33 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
             _shot(f"after_signin_{st}")
             if st == "gone":
                 idle_rounds = 0
+                post_password_idle_since = 0.0
                 continue
             detail = _visible_error_text(page)
-            # captcha 专项识别：触发人机验证时，再试密码也没用（验证码会一直在），直接明确报错。
-            if detail and any(m in detail.lower() for m in ("captcha", "验证码", "are you human", "robot")):
+            body_now = (_body_text(page) or "").lower()
+            captcha_markers = (
+                "captcha", "验证码", "are you human", "robot",
+                "security check", "security challenge", "click verify to start",
+                "didn't catch that",
+            )
+            captcha_hit = (
+                (detail and any(m in detail.lower() for m in captcha_markers))
+                or any(m in body_now for m in (
+                    "security check", "security challenge", "click verify to start",
+                ))
+            )
+            if captcha_hit:
                 _shot("captcha")
                 return LoginOutcome(
                     False, changed,
-                    f"触发 AWS 人机验证 captcha（{detail}）：请降低并发至 1~2 并挂代理（不同 IP）后重试")
+                    f"触发 AWS 人机验证 captcha（{detail or 'Security check'}）：请降低并发至 1~2 并挂代理（不同 IP）后重试")
             if pw_attempts >= len(password_candidates):
                 return LoginOutcome(
                     False, changed,
                     f"Login that bai o trang password: {detail or 'khong qua duoc (sai pass?)'}")
             log(f"    chua qua password ({detail or 'thu lai'}) -> 换下一个候选密码重试")
             idle_rounds = 0
+            post_password_idle_since = 0.0
             continue
 
         # --- USERNAME page: co text input, chua co password ---
@@ -1261,6 +1530,7 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
             except Exception:
                 pass
             idle_rounds = 0
+            post_password_idle_since = 0.0
             continue
 
         # --- khong co gi de lam ---
@@ -1270,9 +1540,451 @@ def _flow(page, url, email, password, new_password, log, stop_event, timeout_s,
         # nhin nhu "卡住没有日志"。改为持续等待并周期性提示。
         if pw_attempts >= 1 and idle_rounds in (4, 10, 20):
             log("    da qua password, dang doi trang xac nhan/Allow access")
+        if goal == "change_password" and pw_attempts >= 1:
+            now = time.time()
+            if not post_password_idle_since:
+                post_password_idle_since = now
+            elif now - post_password_idle_since >= max(1, int(failure_wait_s or 60)):
+                if seen_password:
+                    body_now = (_body_text(page) or "").lower()
+                    if _is_idc_portal_home(page, body_now) or _count_visible(page, "input[type=password]") == 0:
+                        log("    登录后未出现授权页，按已登录继续处理账号安全设置")
+                        return _after_signed_in()
+                return LoginOutcome(
+                    False,
+                    changed,
+                    "密码提交后等待授权确认页面超过 %d 秒" % max(1, int(failure_wait_s or 60)),
+                    mfa_secret=mfa_secret,
+                )
         time.sleep(0.6)
 
     return LoginOutcome(False, changed, "Timeout - khong hoan tat login trong thoi gian cho.")
+
+
+IDC_PASSWORD_CHANGED_MARKERS = (
+    "password updated",
+    "password has been updated",
+    "password has been changed",
+    "password successfully",
+    "successfully changed",
+    "successfully updated",
+    "your password has been",
+    "password saved",
+    "密码已",
+    "密码修改成功",
+    "已更新密码",
+)
+IDC_CHANGE_PASSWORD_FORM_MARKERS = (
+    "change password",
+    "update password",
+    "current password",
+    "new password",
+    "confirm password",
+    "re-enter",
+    "reenter",
+    "修改密码",
+    "当前密码",
+    "新密码",
+    "确认密码",
+)
+
+
+def _is_idc_portal_home(page, body: str) -> bool:
+    """True when the access portal home is visible (already signed in)."""
+    text = (body or "").lower()
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    if any(tok in url for tok in ("/login", "/signin", "device.sso", "/oidc")):
+        return False
+    if _count_visible(page, "input[type=password]") >= 1:
+        return False
+    if _count_visible(page, "input[type=text]:not([type=hidden]), input[type=email]") >= 1:
+        if not any(m in text for m in ("your applications", "aws access portal", "change password")):
+            return False
+    if "awsapps.com" in url and any(tok in url for tok in ("/start", "/portal")):
+        if "device" not in url and "oidc" not in url:
+            if any(m in text for m in (
+                "your applications", "aws access portal",
+                "applications assigned to you", "change password",
+                "applications",
+            )):
+                return True
+    return any(m in text for m in (
+        "aws access portal", "your applications",
+        "applications assigned to you",
+    ))
+
+
+def _open_idc_user_menu(page, log) -> bool:
+    """AWS access portal puts Change password under the username menu."""
+    selectors = (
+        'button[aria-haspopup="menu"]:visible',
+        'button[aria-label*="user" i]:visible',
+        'button[aria-label*="account" i]:visible',
+        '[data-testid*="user-menu" i]:visible',
+        '[class*="user-menu" i] button:visible',
+    )
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() and el.is_visible():
+                el.click(timeout=2500)
+                log("    -> 打开门户用户菜单")
+                time.sleep(0.4)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _open_idc_settings_item(page, log, texts) -> bool:
+    menu_texts = list(texts) + [
+        "Account settings",
+        "Settings",
+        "Profile",
+        "Security",
+        "账户设置",
+        "账号设置",
+        "安全设置",
+    ]
+    if _click_visible_label(page, texts, log):
+        return True
+    if _open_idc_user_menu(page, log):
+        if _click_visible_label(page, menu_texts, log):
+            return True
+    return False
+
+
+def _open_idc_change_password(page, log) -> bool:
+    texts = [
+        "Change password",
+        "Reset password",
+        "Update password",
+        "修改密码",
+        "更改密码",
+    ]
+    return _open_idc_settings_item(page, log, texts)
+
+
+def _open_idc_mfa_settings(page, log) -> bool:
+    texts = [
+        "Assign MFA device",
+        "Register MFA device",
+        "Add MFA device",
+        "Add MFA",
+        "Manage MFA",
+        "Set up MFA",
+        "Multi-factor authentication",
+        "Authenticator app",
+        "MFA devices",
+        "绑定 MFA",
+        "添加 MFA",
+        "多重身份验证",
+        "身份验证程序",
+    ]
+    return _open_idc_settings_item(page, log, texts)
+
+
+def _idc_portal_origin(page) -> str:
+    try:
+        parsed = urlparse(page.url or "")
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        pass
+    return ""
+
+
+def _apply_idc_account_security(
+    page,
+    current_password: str,
+    new_password: str,
+    log,
+    _shot,
+    stop_event,
+    deadline: float,
+    on_password_changed,
+    on_secret,
+    already_changed: bool,
+    mfa_secret: str,
+    initial_mfa_secret: str,
+    bound_mfa_during_login: bool,
+    do_change_password: bool,
+    do_change_mfa: bool,
+) -> LoginOutcome:
+    """After IDC portal login: optionally change password and/or set/replace 2FA."""
+    changed_password = already_changed
+    changed_mfa = bool(bound_mfa_during_login and mfa_secret and mfa_secret != (initial_mfa_secret or ""))
+    if do_change_password:
+        if already_changed and new_password:
+            log("    登录过程中已经改过密码，跳过门户改密")
+        else:
+            pw_out = _change_password_on_idc_portal(
+                page, current_password, new_password, log, _shot, stop_event,
+                deadline, on_password_changed, already_changed=already_changed,
+                mfa_secret=mfa_secret,
+            )
+            mfa_secret = pw_out.mfa_secret or mfa_secret
+            if not pw_out.ok:
+                return LoginOutcome(
+                    False, pw_out.changed_password, pw_out.error,
+                    mfa_secret=mfa_secret, changed_mfa=changed_mfa,
+                )
+            changed_password = True
+    elif already_changed:
+        log("    本次未勾选改密；登录过程中的首次强制改密已写入备用新密码")
+
+    if do_change_mfa:
+        if changed_mfa:
+            log("    登录过程中已绑定新 2FA，跳过门户更换")
+        else:
+            mfa_out = _change_mfa_on_idc_portal(
+                page, log, _shot, stop_event, deadline, on_secret,
+                current_secret=mfa_secret,
+            )
+            if mfa_out.mfa_secret:
+                mfa_secret = mfa_out.mfa_secret
+            if not mfa_out.ok:
+                return LoginOutcome(
+                    False, changed_password, mfa_out.error,
+                    mfa_secret=mfa_secret, changed_mfa=changed_mfa,
+                )
+            changed_mfa = True
+            mfa_secret = mfa_out.mfa_secret or mfa_secret
+    return LoginOutcome(
+        True, changed_password, mfa_secret=mfa_secret, changed_mfa=changed_mfa,
+    )
+
+
+def _change_password_on_idc_portal(
+    page,
+    current_password: str,
+    new_password: str,
+    log,
+    _shot,
+    stop_event,
+    deadline: float,
+    on_password_changed,
+    already_changed: bool,
+    mfa_secret: str,
+) -> LoginOutcome:
+    if already_changed and new_password:
+        log("    登录过程中已经改过密码，跳过门户改密")
+        return LoginOutcome(True, True, mfa_secret=mfa_secret)
+    if not new_password:
+        return LoginOutcome(False, already_changed, "未提供新密码", mfa_secret=mfa_secret)
+    log("    开始在 IDC 门户改密")
+    _shot("idc_portal_change")
+    submit_attempts = 0
+    opened = False
+    tried_settings_url = False
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return LoginOutcome(False, already_changed, "Da huy", mfa_secret=mfa_secret)
+        _maybe_cookie_accept(page, log)
+        body = (_body_text(page) or "").lower()
+        pw_n = _count_visible(page, "input[type=password]")
+        if any(m in body for m in IDC_PASSWORD_CHANGED_MARKERS):
+            log("    IDC 门户显示密码已更新")
+            _shot("password_changed")
+            if on_password_changed:
+                try:
+                    on_password_changed(new_password)
+                except Exception:
+                    pass
+            return LoginOutcome(True, True, mfa_secret=mfa_secret)
+        if pw_n >= 2 and (
+            any(m in body for m in IDC_CHANGE_PASSWORD_FORM_MARKERS) or opened
+        ):
+            submit_attempts += 1
+            if submit_attempts > 3:
+                detail = _visible_error_text(page)
+                _shot("change_password_stuck")
+                return LoginOutcome(
+                    False, already_changed,
+                    f"IDC 门户改密失败：{detail or '页面未进入下一步'}",
+                    mfa_secret=mfa_secret,
+                )
+            if any(m in body for m in INCORRECT_MARKERS) and submit_attempts > 1:
+                detail = _visible_error_text(page) or "当前密码不正确或新密码不符合策略"
+                _shot("change_password_rejected")
+                return LoginOutcome(
+                    False, already_changed,
+                    f"IDC 门户改密被拒绝：{detail}",
+                    mfa_secret=mfa_secret,
+                )
+            log("    填写 IDC 改密表单")
+            fill_and_submit_password_form(
+                page, current_password, new_password, log,
+                extra_submit_texts=PASSWORD_CHANGE_SUBMIT_TEXTS_EXTRA,
+            )
+            time.sleep(1.2)
+            body_after = (_body_text(page) or "").lower()
+            if any(m in body_after for m in IDC_PASSWORD_CHANGED_MARKERS) or _count_visible(page, "input[type=password]") < 2:
+                log("    IDC 门户改密成功")
+                _shot("password_changed")
+                if on_password_changed:
+                    try:
+                        on_password_changed(new_password)
+                    except Exception:
+                        pass
+                return LoginOutcome(True, True, mfa_secret=mfa_secret)
+            if any(m in body_after for m in INCORRECT_MARKERS):
+                detail = _visible_error_text(page) or "当前密码不正确或新密码不符合策略"
+                _shot("change_password_rejected")
+                return LoginOutcome(
+                    False, already_changed,
+                    f"IDC 门户改密被拒绝：{detail}",
+                    mfa_secret=mfa_secret,
+                )
+            continue
+        if _open_idc_change_password(page, log):
+            opened = True
+            time.sleep(1.0)
+            _shot("opened_change_password")
+            continue
+        if not tried_settings_url:
+            tried_settings_url = True
+            origin = _idc_portal_origin(page)
+            if origin:
+                for dest in (f"{origin}/start/#/settings", f"{origin}/start/#/settings/password"):
+                    try:
+                        log(f"    打开门户设置页 {dest}")
+                        page.goto(dest, wait_until="domcontentloaded")
+                        opened = True
+                        time.sleep(1.0)
+                        _shot("idc_settings_url")
+                        break
+                    except Exception:
+                        continue
+                continue
+        time.sleep(0.6)
+    _shot("change_password_timeout")
+    return LoginOutcome(False, already_changed, "登录成功但未能完成 IDC 门户改密", mfa_secret=mfa_secret)
+
+
+def _fill_current_totp_if_present(page, secret: str, log) -> bool:
+    """If the settings page asks for the current authenticator code, fill it."""
+    if not secret:
+        return False
+    remaining = 30 - (int(time.time()) % 30)
+    if remaining <= 8:
+        time.sleep(remaining + 1)
+    code = mfa_totp.totp_now(secret)
+    filled = False
+    selectors = (
+        "input[autocomplete=one-time-code]:visible",
+        "input[name*=code i]:visible",
+        "input[name*=otp i]:visible",
+        "input[name*=mfa i]:visible",
+        "input[inputmode=numeric]:visible",
+        "input[type=tel]:visible",
+        "input[type=text]:visible",
+    )
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                loc.click(timeout=1500)
+                loc.fill("")
+                loc.type(code, delay=20)
+                filled = True
+                break
+        except Exception:
+            continue
+    if not filled:
+        return False
+    log("    已填入当前 2FA 验证码，准备更换设备")
+    _click_button(page, ["Continue", "Next", "Verify", "Confirm", "Submit", "继续", "下一步", "确认"], log)
+    time.sleep(0.8)
+    return True
+
+
+def _change_mfa_on_idc_portal(
+    page,
+    log,
+    _shot,
+    stop_event,
+    deadline: float,
+    on_secret,
+    current_secret: str,
+) -> LoginOutcome:
+    log("    开始在 IDC 门户设置/更换 2FA")
+    _shot("idc_portal_mfa")
+    opened = False
+    tried_settings_url = False
+    register_attempts = 0
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return LoginOutcome(False, error="Da huy", mfa_secret=current_secret)
+        _maybe_cookie_accept(page, log)
+        body = (_body_text(page) or "").lower()
+        has_register = any(m in body for m in MFA_REGISTER_MARKERS)
+        if has_register or (
+            any(m in body for m in MFA_MARKERS)
+            and _count_visible(page, "input[type=text]:not([type=hidden]), input[type=tel]") >= 1
+            and any(m in body for m in ("secret key", "qr code", "authenticator app", "assign mfa", "register mfa"))
+        ):
+            register_attempts += 1
+            if register_attempts > 3:
+                return LoginOutcome(
+                    False, error="IDC 门户 2FA 绑定多次未完成",
+                    mfa_secret=current_secret,
+                )
+            log("    检测到 2FA 绑定页，开始注册 authenticator")
+            ok_mfa, sec = _handle_mfa_registration(
+                page, log, _shot, known_secret="", on_secret=on_secret, settings_page=True,
+            )
+            if ok_mfa and sec:
+                log("    IDC 门户 2FA 绑定成功")
+                _shot("mfa_changed")
+                return LoginOutcome(True, mfa_secret=sec, changed_mfa=True)
+            time.sleep(1.0)
+            continue
+        if current_secret and any(m in body for m in MFA_VERIFY_MARKERS):
+            _fill_current_totp_if_present(page, current_secret, log)
+            time.sleep(0.8)
+            continue
+        if _click_visible_label(page, [
+            "Replace MFA device", "Replace device", "Change MFA device",
+            "Remove MFA device", "Delete MFA device", "Unregister",
+            "Add MFA device", "Assign MFA device", "Register MFA device",
+            "Set up MFA", "Add another device",
+            "更换 MFA", "替换设备", "删除 MFA", "添加 MFA",
+        ], log):
+            opened = True
+            time.sleep(1.0)
+            _shot("opened_replace_mfa")
+            continue
+        if not opened and _open_idc_mfa_settings(page, log):
+            opened = True
+            time.sleep(1.0)
+            _shot("opened_mfa_settings")
+            continue
+        if not tried_settings_url:
+            tried_settings_url = True
+            origin = _idc_portal_origin(page)
+            if origin:
+                for dest in (
+                    f"{origin}/start/#/settings",
+                    f"{origin}/start/#/settings/mfa",
+                    f"{origin}/start/#/settings/security",
+                ):
+                    try:
+                        log(f"    打开门户 MFA 设置页 {dest}")
+                        page.goto(dest, wait_until="domcontentloaded")
+                        opened = True
+                        time.sleep(1.0)
+                        _shot("idc_mfa_settings_url")
+                        break
+                    except Exception:
+                        continue
+                continue
+        time.sleep(0.6)
+    _shot("change_mfa_timeout")
+    return LoginOutcome(False, error="登录成功但未能完成 IDC 门户 2FA 设置", mfa_secret=current_secret)
 
 
 def _is_button_visible(page, text: str) -> bool:
@@ -1292,5 +2004,6 @@ def _is_button_visible(page, text: str) -> bool:
 __all__ = [
     "LoginOutcome", "AccountRow",
     "read_accounts_file", "write_account_result",
-    "drive_login", "DEFAULT_IDC_START_URL", "DEFAULT_NEW_PASSWORD",
+    "drive_login", "drive_change_password",
+    "DEFAULT_IDC_START_URL", "DEFAULT_NEW_PASSWORD",
 ]

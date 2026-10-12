@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>IDC 格式转换</title>
+  <style>
+    :root{
+      color-scheme:dark;
+      --bg:#070a11; --panel:rgba(15,23,42,.86); --panel2:rgba(2,6,23,.66);
+      --line:rgba(148,163,184,.22); --line2:rgba(148,163,184,.34); --text:#eef2ff; --muted:#94a3b8;
+      --brand:#60a5fa; --brand2:#22c55e; --bad:#fb7185; --ok:#86efac; --warn:#fbbf24;
+      --shadow:0 24px 70px rgba(0,0,0,.34);
+    }
+    *{box-sizing:border-box}
+    html{min-height:100%;background:var(--bg)}
+    body{margin:0;min-height:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 12% -12%,rgba(96,165,250,.30),transparent 32%),radial-gradient(circle at 86% 0%,rgba(34,197,94,.18),transparent 28%),linear-gradient(180deg,#070a11,#0b1020 58%,#070a11)}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);background-size:44px 44px;mask-image:linear-gradient(to bottom,rgba(0,0,0,.78),transparent)}
+    main{max-width:1480px;margin:0 auto;padding:16px clamp(14px,1.8vw,30px) 24px;position:relative}
+    .topbar{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:14px;padding:14px 16px;border:1px solid rgba(148,163,184,.16);border-radius:24px;background:linear-gradient(135deg,rgba(15,23,42,.72),rgba(2,6,23,.42));box-shadow:0 18px 60px rgba(0,0,0,.22);backdrop-filter:blur(18px)}
+    .eyebrow{display:inline-flex;align-items:center;gap:8px;color:#bfdbfe;background:rgba(96,165,250,.12);border:1px solid rgba(96,165,250,.24);border-radius:999px;padding:5px 9px;font-size:11px;font-weight:800}
+    h1{margin:6px 0 3px;font-size:clamp(26px,3.4vw,40px);line-height:1;letter-spacing:-.04em}
+    .subtitle{display:block;max-width:760px;margin:0;color:var(--muted);font-size:12px;line-height:1.45}
+    .session{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+    .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:rgba(15,23,42,.72);border-radius:999px;padding:7px 11px;color:#cbd5e1;font-size:12px;font-weight:750;white-space:nowrap}
+    .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
+    .card{background:linear-gradient(180deg,rgba(15,23,42,.90),rgba(2,6,23,.76));border:1px solid rgba(148,163,184,.20);border-radius:22px;box-shadow:var(--shadow);backdrop-filter:blur(18px);overflow:hidden}
+    .card-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;padding:16px 18px 12px;border-bottom:1px solid var(--line)}
+    .card-title{margin:0;font-size:17px;letter-spacing:-.02em}
+    .card-desc{display:block;margin:4px 0 0;color:var(--muted);font-size:11px;line-height:1.35}
+    .card-body{padding:14px 18px 16px}
+    label{display:block;margin:0 0 6px;color:#dbeafe;font-size:11px;font-weight:850;letter-spacing:.03em;text-transform:uppercase}
+    textarea,input{width:100%;border:1px solid rgba(148,163,184,.25);background:var(--panel2);color:var(--text);border-radius:14px;padding:10px 12px;font-size:13px;outline:none;transition:border-color .18s,box-shadow .18s,background .18s}
+    textarea{min-height:460px;resize:vertical;font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,monospace;line-height:1.45}
+    textarea:focus,input:focus{border-color:rgba(96,165,250,.78);box-shadow:0 0 0 4px rgba(96,165,250,.13);background:rgba(2,6,23,.92)}
+    .actions{display:flex;flex-wrap:wrap;gap:9px;margin-top:10px}
+    button,.button{border:0;border-radius:14px;padding:10px 15px;background:rgba(51,65,85,.86);color:white;font-weight:900;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:42px;transition:transform .15s,opacity .15s,background .15s,box-shadow .15s}
+    button:hover,.button:hover{transform:translateY(-1px)}
+    .primary{background:linear-gradient(135deg,#3b82f6,#22c55e);box-shadow:0 12px 30px rgba(34,197,94,.20)}
+    .secondary{background:rgba(30,41,59,.92)}
+    .danger{background:rgba(127,29,29,.72);color:#fecaca}
+    .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px}
+    .metric{border:1px solid rgba(148,163,184,.18);border-radius:16px;padding:10px 11px;background:linear-gradient(180deg,rgba(15,23,42,.72),rgba(2,6,23,.50))}
+    .metric strong{display:block;font-size:20px;letter-spacing:-.03em}
+    .metric span{display:block;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+    .meta{display:grid;gap:8px;margin:12px 0}
+    .fieldline{display:grid;grid-template-columns:110px minmax(0,1fr);gap:8px;align-items:center;border:1px solid rgba(148,163,184,.15);border-radius:14px;padding:9px 10px;background:rgba(2,6,23,.25)}
+    .fieldline span{color:#bfdbfe;font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.04em}
+    .fieldline code{min-width:0;color:#cbd5e1;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;overflow-wrap:anywhere}
+    .note{margin:8px 0 0;color:var(--muted);font-size:11px;line-height:1.45}
+    .issues{display:none;margin-top:10px;border:1px solid rgba(251,191,36,.28);border-radius:14px;background:rgba(251,191,36,.08);padding:9px 10px;color:#fde68a;font-size:12px;line-height:1.5;white-space:pre-wrap}
+    .toast{min-height:18px;margin-top:8px;color:#bbf7d0;font-size:12px;font-weight:800}
+    @media(max-width:980px){
+      main{padding:14px 10px 24px}
+      .topbar{display:block}
+      .session{justify-content:flex-start;margin-top:10px}
+      .grid{grid-template-columns:1fr}
+      textarea{min-height:300px}
+      .stats{grid-template-columns:1fr}
+      .card-head,.card-body{padding-left:13px;padding-right:13px}
+      .topbar h1{font-size:30px}
+      .actions .button,.actions button{flex:1}
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header class="topbar">
+    <div>
+      <span class="eyebrow">IDC Record Converter</span>
+      <h1>IDC 格式转换</h1>
+      <p class="subtitle">把 idc::starturl----username----password----newpassword 转成当前账号框可用的 username:password。</p>
+    </div>
+    <form class="session" method="post" action="/logout">
+      <span class="pill">{{ customer_name }}</span>
+      <a class="button secondary" href="/">获取 JSON</a>
+      <a class="button secondary" href="/security">改密 / 2FA</a>
+      <a class="button secondary" href="/">返回工具</a>
+      <button class="secondary" type="submit">退出</button>
+    </form>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">原始数据</h2><p class="card-desc">每行一条，分隔符为四个连续短横线。</p></div>
+      </div>
+      <div class="card-body">
+        <label for="source">IDC 四段格式</label>
+        <textarea id="source" spellcheck="false" placeholder="idc::https://ssoins-xxxx.us-east-1.portal.amazonaws.com----username----password----newpassword"></textarea>
+        <div class="actions">
+          <button id="convert" class="primary" type="button">转换</button>
+          <button id="clear" class="secondary" type="button">清空</button>
+        </div>
+        <p class="note">字段里的普通短横线会保留；只有四个连续短横线会作为分隔符。</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div><h2 class="card-title">转换结果</h2><p class="card-desc">输出为 username:password，每行一个账号。</p></div>
+      </div>
+      <div class="card-body">
+        <div class="stats">
+          <div class="metric"><strong id="okCount">0</strong><span>有效行</span></div>
+          <div class="metric"><strong id="skipCount">0</strong><span>跳过行</span></div>
+          <div class="metric"><strong id="urlCount">0</strong><span>Start URL</span></div>
+        </div>
+        <div class="meta">
+          <div class="fieldline"><span>Start URL</span><code id="firstUrl">-</code></div>
+          <div class="fieldline"><span>New Password</span><code id="newPassState">已解析但不输出</code></div>
+        </div>
+        <label for="output">username:password</label>
+        <textarea id="output" spellcheck="false" readonly></textarea>
+        <div class="actions">
+          <button id="copy" class="primary" type="button">复制结果</button>
+          <button id="download" class="secondary" type="button">下载 TXT</button>
+          <button id="fillAccounts" class="secondary" type="button">填入账号框</button>
+        </div>
+        <div id="issues" class="issues"></div>
+        <div id="toast" class="toast"></div>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function setToast(message, bad=false){
+  const el=$('toast');
+  el.textContent=message||'';
+  el.style.color=bad?'#fecaca':'#bbf7d0';
+}
+function findDelimiters(line, count){
+  const positions=[];
+  let from=0;
+  while(positions.length<count){
+    const idx=line.indexOf('----', from);
+    if(idx<0)break;
+    positions.push(idx);
+    from=idx+4;
+  }
+  return positions;
+}
+function splitIdcLine(line){
+  const positions=findDelimiters(line, 3);
+  if(positions.length<3)return null;
+  const a=line.slice(0, positions[0]);
+  const b=line.slice(positions[0]+4, positions[1]);
+  const c=line.slice(positions[1]+4, positions[2]);
+  const d=line.slice(positions[2]+4);
+  return [a,b,c,d];
+}
+function stripIdcPrefix(value){
+  return String(value||'').replace(/^idc::/i,'').trim();
+}
+function convertRecords(){
+  const source=$('source').value||'';
+  const output=[];
+  const issues=[];
+  const urls=new Set();
+  let skipped=0;
+  let newPasswordCount=0;
+  source.split(/\r?\n/).forEach((raw, i)=>{
+    const line=raw.trim();
+    if(!line)return;
+    const parts=splitIdcLine(line);
+    if(!parts){
+      skipped++;
+      issues.push(`第 ${i+1} 行：未找到完整四段分隔符`);
+      return;
+    }
+    const startUrl=stripIdcPrefix(parts[0]);
+    const username=parts[1].trim();
+    const password=parts[2];
+    const newPassword=parts[3];
+    if(startUrl)urls.add(startUrl);
+    if(newPassword)newPasswordCount++;
+    if(!username || !password){
+      skipped++;
+      issues.push(`第 ${i+1} 行：username 或 password 为空`);
+      return;
+    }
+    output.push(`${username}:${password}`);
+  });
+  $('output').value=output.join('\n');
+  $('okCount').textContent=String(output.length);
+  $('skipCount').textContent=String(skipped);
+  $('urlCount').textContent=String(urls.size);
+  $('firstUrl').textContent=urls.size?[...urls][0]:'-';
+  $('newPassState').textContent=newPasswordCount?`已解析 ${newPasswordCount} 条，不输出`:'-';
+  const issuesBox=$('issues');
+  issuesBox.textContent=issues.join('\n');
+  issuesBox.style.display=issues.length?'block':'none';
+  setToast(output.length?`已转换 ${output.length} 行`:'没有可输出的账号', !output.length);
+}
+async function copyResult(){
+  const out=$('output');
+  if(!out.value.trim()){
+    setToast('没有可复制的结果', true);
+    return;
+  }
+  out.focus();
+  out.select();
+  try{
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(out.value);
+    }else{
+      document.execCommand('copy');
+    }
+    setToast('已复制');
+  }catch(e){
+    setToast('复制失败，请手动选择复制', true);
+  }
+}
+function downloadResult(){
+  const value=$('output').value;
+  if(!value.trim()){
+    setToast('没有可下载的结果', true);
+    return;
+  }
+  const blob=new Blob([value+'\n'],{type:'text/plain;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;
+  a.download='kiro-accounts.txt';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  setToast('已生成 TXT');
+}
+function fillAccounts(){
+  const value=$('output').value;
+  if(!value.trim()){
+    setToast('没有可填入的结果', true);
+    return;
+  }
+  try{
+    sessionStorage.setItem('kiroConverterAccounts', value);
+    const startUrl=$('firstUrl').textContent||'';
+    if(startUrl && startUrl!=='-')sessionStorage.setItem('kiroConverterStartUrl', startUrl);
+    setToast('已暂存，返回工具后自动填入账号框');
+  }catch(e){
+    setToast('浏览器暂存失败，请复制结果后手动粘贴', true);
+  }
+}
+$('convert').addEventListener('click', convertRecords);
+$('copy').addEventListener('click', copyResult);
+$('download').addEventListener('click', downloadResult);
+$('fillAccounts').addEventListener('click', fillAccounts);
+$('clear').addEventListener('click', ()=>{
+  $('source').value='';
+  $('output').value='';
+  $('okCount').textContent='0';
+  $('skipCount').textContent='0';
+  $('urlCount').textContent='0';
+  $('firstUrl').textContent='-';
+  $('newPassState').textContent='-';
+  $('issues').style.display='none';
+  $('issues').textContent='';
+  setToast('');
+  $('source').focus();
+});
+$('source').addEventListener('input', ()=>{
+  if(($('source').value||'').length>0)convertRecords();
+});
+</script>
+</body>
+</html>
